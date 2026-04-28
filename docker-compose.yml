@@ -1,0 +1,36 @@
+services:
+  nsp:
+    image: ghcr.io/nsiod/nsp:latest
+    container_name: nsp
+    hostname: nsp
+    cap_add:
+      - NET_ADMIN
+    environment:
+      # --- required ---
+      # 32-byte master key, base64 encoded. Generate with `nsp generate-key`.
+      NSP_MASTER_KEY: ${NSP_MASTER_KEY:?set NSP_MASTER_KEY to a 32-byte base64 value}
+
+      # --- common ---
+      # Hostname embedded in self-signed cert & used as ACME default domain.
+      NSP_DOMAIN: ${NSP_DOMAIN:-nsp.local}
+      # Optional: set on first boot to seed the admin password; remove after.
+      NSP_ADMIN_PASSWORD: ${NSP_ADMIN_PASSWORD:-}
+      RUST_LOG: ${RUST_LOG:-info}
+
+      # --- ACME (uncomment + set NSP_DOMAIN to a real DNS name) ---
+      # NSP_ACME: "true"
+      # NSP_ACME_EMAIL: "ops@example.com"
+      # NSP_ACME_PRODUCTION: "true"
+
+      # --- Metrics (bearer-token auth; leave blank for admin-JWT auth) ---
+      # NSP_METRICS_TOKEN: "changeme"
+
+    volumes:
+      - ./work:/work
+    ports:
+      - "80:80/tcp"
+      - "443:443/tcp"
+      - "4433:4433/tcp"
+      - "4433:4433/udp"
+      - "51820:51820/udp"
+    restart: unless-stopped

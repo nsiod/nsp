@@ -1,0 +1,59 @@
+# nsp configuration example
+#
+# Usage:
+#   nsp --config ./nsp.example.toml
+
+[http]
+listen = "0.0.0.0:443"
+domain = "proxy.example.com"
+
+[tls]
+enabled = false
+cert_path = ""
+key_path = ""
+
+[tls.acme]
+enabled = false
+email = "ops@example.com"
+domains = ["proxy.example.com"]
+production = false
+cache_dir = "/work/acme"
+
+[storage]
+db_path = "/work/data/proxy.db"
+work_dir = "/work"
+
+[security]
+# Empty string is allowed but usually clearer to omit this key entirely when
+# encryption is intentionally disabled.
+master_key = ""
+allow_insecure_no_master_key = false
+admin_password = "changeme"
+jwt_ttl_secs = 900
+
+[wireguard]
+enabled = false
+port = 51820
+subnet = "10.255.0.0/16"
+interface = "wg0"
+
+[shadowsocks]
+enabled = false
+bind = "0.0.0.0"
+port = 4433
+apply_debounce_ms = 500
+
+[logging]
+level = "info"
+json = true
+
+[metrics]
+enabled = false
+bearer_token = ""
+refresh_ms = 10000
+
+[backup]
+enabled = true
+interval_secs = 3600
+dir = "/work/backups"
+retention_days = 7

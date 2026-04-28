@@ -1,0 +1,105 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nsp",
+    "crates/core",
+    "crates/db",
+    "crates/ss-driver",
+    "crates/wg-driver",
+    "crates/netctl",
+    "crates/api",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MPL-2.0"
+repository = "https://github.com/nsiod/nsp"
+authors = ["nsp contributors"]
+
+[workspace.dependencies]
+# Runtime & I/O
+tokio = { version = "1.40", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# HTTP / TLS
+axum = { version = "0.7", features = ["macros"] }
+axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "trace", "compression-br", "cors"] }
+hyper = { version = "1", features = ["http1", "http2"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+
+# Serialization / config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+figment = { version = "0.10", features = ["toml", "env"] }
+clap = { version = "4", features = ["derive", "env"] }
+
+# Database
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "sqlite",
+    "uuid",
+    "chrono",
+    "migrate",
+    "macros",
+] }
+
+# Errors / logging
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Auth / crypto
+argon2 = "0.5"
+jsonwebtoken = "9"
+rand = "0.8"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+secrecy = { version = "0.10", features = ["serde"] }
+subtle = "2"
+
+# Utilities
+base64 = "0.22"
+hex = "0.4"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+uuid = { version = "1", features = ["v7", "serde"] }
+rust-embed = { version = "8", features = ["include-exclude"] }
+mime_guess = "2"
+mime = "0.3"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+
+# WireGuard.
+# Pinned to mullvad/gotatun main at 9fcc37b (Merge branch 'cookie-source-port').
+gotatun = { git = "https://github.com/mullvad/gotatun", rev = "9fcc37b2dc4315bcadb0c59d26b93793642710d2", default-features = false, features = ["ring", "tun", "device"] }
+ipnetwork = "0.21"
+qrcode = { version = "0.14", default-features = false, features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Observability
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.17", default-features = false }
+
+# ACME. Pinned to ring backend to avoid dragging in aws-lc-rs and
+# to match the rustls provider used everywhere else.
+rustls-acme = { version = "0.14", default-features = false, features = ["ring", "tls12", "tokio", "axum", "webpki-roots"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+strip = true
+panic = "abort"
+
+[profile.dev]
+debug = 1

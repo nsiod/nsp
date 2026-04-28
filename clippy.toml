@@ -1,0 +1,2 @@
+cognitive-complexity-threshold = 15
+allow-print-in-tests = true

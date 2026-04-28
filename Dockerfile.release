@@ -1,0 +1,68 @@
+# syntax=docker/dockerfile:1.7
+#
+# Release image for nsp.
+#
+# Goals:
+#   - Reproducible: pinned base image tags + digest-friendly ARGs, deterministic
+#     build flags, the workspace ``[profile.release]`` already sets
+#     ``lto=thin`` / ``codegen-units=1`` / ``strip=true`` / ``panic=abort``.
+#   - Small: static musl binary, stripped at link time and again after build,
+#     alpine:3.20 runtime (~7.5 MB) with only iproute2, tini, ca-certificates.
+#     Final image size target: < 30 MB.
+#   - Safe: runs as non-root ``nsp`` user. The container still needs
+#     NET_ADMIN granted by the caller (docker-compose / k8s) when the
+#     WireGuard driver is enabled.
+
+ARG RUST_IMAGE=rust:1.90-alpine3.20
+ARG RUNTIME_IMAGE=alpine:3.20
+
+# --------------------------------------------------------------------------
+# Build stage.
+# --------------------------------------------------------------------------
+FROM ${RUST_IMAGE} AS build
+RUN apk add --no-cache musl-dev pkgconfig perl make bash sqlite-static
+WORKDIR /src
+
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY .cargo ./.cargo
+COPY crates ./crates
+COPY migrations ./migrations
+COPY ui/dist ./ui/dist
+
+ENV CARGO_TERM_COLOR=always \
+    RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-s"
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    set -eux; \
+    rustup target add x86_64-unknown-linux-musl; \
+    cargo build --release --target x86_64-unknown-linux-musl -p nsp --locked; \
+    mkdir -p /out; \
+    install -m 0755 target/x86_64-unknown-linux-musl/release/nsp /out/nsp; \
+    strip /out/nsp
+
+# --------------------------------------------------------------------------
+# Runtime stage — minimal alpine, non-root.
+# --------------------------------------------------------------------------
+FROM ${RUNTIME_IMAGE} AS runtime
+RUN apk add --no-cache iproute2 ca-certificates tini \
+ && addgroup -S nsp \
+ && adduser -S -G nsp -H -D nsp \
+ && mkdir -p /work/data /work/acme /work/backups /etc/nsp \
+ && chown -R nsp:nsp /work
+
+COPY --from=build /out/nsp /usr/local/bin/nsp
+
+ENV NSP_DB=/work/data/proxy.db \
+    NSP_WORK_DIR=/work \
+    NSP_ACME_CACHE=/work/acme \
+    NSP_BACKUP_DIR=/work/backups \
+    NSP_JSON_LOGS=true \
+    RUST_LOG=info
+
+USER nsp:nsp
+VOLUME ["/work"]
+EXPOSE 80 443 4433 4433/udp 51820/udp
+
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/nsp"]
+CMD ["serve"]

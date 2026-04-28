@@ -1,0 +1,58 @@
+[graph]
+targets = [
+    { triple = "x86_64-unknown-linux-musl" },
+    { triple = "x86_64-unknown-linux-gnu" },
+]
+all-features = false
+no-default-features = false
+
+[advisories]
+version = 2
+yanked = "warn"
+ignore = [
+    # rustls-pemfile is pulled transitively by axum-server 0.7 and flagged
+    # unmaintained (upstream suggests rustls-pki-types::pem). Re-evaluate
+    # when axum-server updates.
+    "RUSTSEC-2025-0134",
+]
+
+[licenses]
+version = 2
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MPL-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "Unicode-3.0",
+    "Zlib",
+    "BSL-1.0",
+]
+confidence-threshold = 0.9
+exceptions = [
+    # `tun` (WTFPL) is pulled in transitively by `gotatun` for userspace TUN
+    # device management. WTFPL is FSF Free/Libre but not in our default allow
+    # list; allow it only for this crate.
+    { name = "tun", allow = ["WTFPL"] },
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+deny = [
+    { name = "openssl" },
+    { name = "openssl-sys" },
+    { name = "native-tls" },
+]
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "allow"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

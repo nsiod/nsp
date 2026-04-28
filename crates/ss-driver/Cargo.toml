@@ -1,0 +1,48 @@
+[package]
+name = "nsp-ss-driver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "nsp_ss_driver"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Opt-in gate for live end-to-end tests that spin up a real SS server and
+# shadowsocks client. Requires network binds; off by default.
+live-e2e = []
+
+[dependencies]
+nsp-core = { path = "../core" }
+nsp-db = { path = "../db" }
+
+async-trait = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+shadowsocks-service = { version = "1.24", default-features = false, features = [
+    "server",
+    "aead-cipher-2022",
+] }
+qrcodegen = "1.8"
+png = "0.17"
+percent-encoding = "2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3"

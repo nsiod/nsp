@@ -1,0 +1,270 @@
+# nsp
+
+A small, single-binary control plane that manages WireGuard and Shadowsocks
+users behind a signed API. State is a single SQLite file; secrets can be sealed
+at rest with a master key; metrics and hourly backups are built in.
+
+* **HTTP/S control plane** — JWT-auth'd REST API + embedded admin SPA.
+* **WireGuard driver** — IPAM, peer lifecycle, `wg set` apply loop.
+* **Shadowsocks driver** — in-process task, debounced key reloads.
+* **Optional TLS** — Let's Encrypt via `rustls-acme` (TLS-ALPN-01), static
+  certs, self-signed fallback, or plaintext HTTP for local/reverse-proxy use.
+* **Observability** — Prometheus `/metrics`, bearer- or JWT-gated.
+* **Backups** — hourly SQLite `VACUUM INTO` snapshots with 7-day retention.
+
+---
+
+## Deploy with Docker
+
+### 1. Generate a master key (one time)
+
+The master key encrypts all secrets at rest. Keep it out of git. If unset or
+empty, data-at-rest encryption is disabled.
+
+```shell
+docker run --rm ghcr.io/nsiod/nsp:latest generate-key
+# e.g. 7M1vPqSg0b4WklHKkzXTUdGd8mnEz82M+U3zSIxwrFk=
+```
+
+Or, if you already have a local build:
+
+```shell
+nsp generate-key
+```
+
+### 2. Create an env file
+
+```shell
+cp .env.example .env
+```
+
+Minimal values to edit:
+
+```dotenv
+NSP_DOMAIN=proxy.example.com
+NSP_ADMIN_PASSWORD=<one-time bootstrap password>
+NSP_MASTER_KEY=<base64 value from step 1>
+```
+
+For local development only, leaving `NSP_MASTER_KEY=` empty also requires
+`NSP_ALLOW_INSECURE_NO_MASTER_KEY=true`. Do not use that override for public
+deployments because it uses a fixed development JWT signing key.
+
+### 3. Run with docker-compose
+
+```shell
+docker compose up -d
+```
+
+The API listens on the configured listener. First login uses the bootstrap password;
+remove `NSP_ADMIN_PASSWORD` from `.env` once a persistent admin
+has been set.
+
+Data is persisted under `./work`:
+
+```
+./work/
+├── data/         # SQLite file (proxy.db)
+├── acme/         # ACME account + cert cache (when enabled)
+└── backups/      # Hourly VACUUM INTO snapshots
+```
+
+### 4. Enable ACME for real certificates
+
+`NSP_DOMAIN` is the externally visible domain used in generated
+client configuration, ACME domain fallback, and self-signed development
+certificates. Point it at a DNS name that resolves to the box, then set:
+
+```
+NSP_TLS=true
+NSP_ACME=true
+NSP_ACME_EMAIL=ops@example.com
+NSP_ACME_PRODUCTION=true
+```
+
+ACME uses the TLS-ALPN-01 challenge, so only `:443` needs to be reachable
+from the internet — no separate `:80` handler is required.
+
+---
+
+## Configuration
+
+Layered, in order of priority (later overrides earlier):
+
+1. Built-in defaults
+2. `--config path/to/nsp.toml`
+3. Environment: flat `NSP_*` names (e.g. `NSP_LISTEN=8443`)
+4. CLI flags (e.g. `--listen`, `--storage-db-path`)
+
+Actual read path in code:
+
+1. `ProxyConfig::default()` creates the baseline config.
+2. `nsp` reads `--config` / `NSP_CONFIG` to choose the TOML path.
+3. If that file exists, it is merged on top of defaults.
+4. Every other CLI flag is declared with a matching `env = "NSP_*"` binding
+   in clap.
+5. Parsed env / CLI values are applied field-by-field on top of the merged TOML.
+
+Important details:
+
+- Missing config files are ignored.
+- Environment variables and CLI flags share the same override path in code.
+- CLI wins over env because clap resolves explicit arguments over env-backed
+  defaults.
+- `--listen` / `NSP_LISTEN` accept either `8443` or `0.0.0.0:8443`.
+- `NSP_ACME_DOMAINS` is comma-separated in env, but a TOML array in config.
+
+Example files:
+
+- [.env.example](./.env.example)
+- [nsp.example.toml](./nsp.example.toml)
+
+Key sections:
+
+| Section       | Purpose                                  |
+| ------------- | ---------------------------------------- |
+| `http`        | Listener address, `domain`               |
+| `tls`         | Enable flag, static cert/key, `[tls.acme]` |
+| `security`    | Master key, first-run admin password     |
+| `storage`     | SQLite path, work dir                    |
+| `wireguard`   | WG subnet, listen port, peer limits      |
+| `shadowsocks` | SS bind, port, apply debounce            |
+| `metrics`     | Enable `/metrics`, optional bearer token |
+| `backup`      | Dir, interval, retention                 |
+
+Common settings use the same config path across TOML, environment variables,
+and CLI flags:
+
+| Config key               | Environment variable           | CLI flag                    |
+| ------------------------ | ------------------------------ | --------------------------- |
+| `http.listen`            | `NSP_LISTEN`                | `--listen`                  |
+| `http.domain`            | `NSP_DOMAIN`                | `--domain`                  |
+| `tls.enabled`            | `NSP_TLS`                   | `--tls-enabled`             |
+| `tls.cert_path`          | `NSP_TLS_CERT`              | `--tls-cert-path`           |
+| `tls.key_path`           | `NSP_TLS_KEY`               | `--tls-key-path`            |
+| `tls.acme.enabled`       | `NSP_ACME`                  | `--tls-acme-enabled`        |
+| `tls.acme.email`         | `NSP_ACME_EMAIL`            | `--tls-acme-email`          |
+| `tls.acme.domains`       | `NSP_ACME_DOMAINS`          | `--tls-acme-domains`        |
+| `tls.acme.production`    | `NSP_ACME_PRODUCTION`       | `--tls-acme-production`     |
+| `tls.acme.cache_dir`     | `NSP_ACME_CACHE`            | `--tls-acme-cache-dir`      |
+| `storage.db_path`        | `NSP_DB`                    | `--storage-db-path`         |
+| `storage.work_dir`       | `NSP_WORK_DIR`              | `--storage-work-dir`        |
+| `security.master_key`    | `NSP_MASTER_KEY`            | `--security-master-key`     |
+| `security.allow_insecure_no_master_key` | `NSP_ALLOW_INSECURE_NO_MASTER_KEY` | `--allow-insecure-no-master-key` |
+| `security.admin_password` | `NSP_ADMIN_PASSWORD`        | `--security-admin-password` |
+| `security.jwt_ttl_secs`  | `NSP_JWT_TTL`               | `--security-jwt-ttl-secs`   |
+| `wireguard.enabled`      | `NSP_WG`                    | `--wireguard-enabled`       |
+| `wireguard.port`         | `NSP_WG_PORT`               | `--wireguard-port`          |
+| `wireguard.subnet`       | `NSP_WG_SUBNET`             | `--wireguard-subnet`        |
+| `wireguard.interface`    | `NSP_WG_INTERFACE`          | `--wireguard-interface`     |
+| `shadowsocks.enabled`    | `NSP_SS`                    | `--shadowsocks-enabled`     |
+| `shadowsocks.bind`       | `NSP_SS_BIND`               | `--shadowsocks-bind`        |
+| `shadowsocks.port`       | `NSP_SS_PORT`               | `--shadowsocks-port`        |
+| `shadowsocks.apply_debounce_ms` | `NSP_SS_DEBOUNCE_MS` | `--shadowsocks-apply-debounce-ms` |
+| `logging.level`          | `NSP_LOG`                   | `--logging-level`           |
+| `logging.json`           | `NSP_JSON_LOGS`             | `--logging-json`            |
+| `metrics.enabled`        | `NSP_METRICS`               | `--metrics-enabled`         |
+| `metrics.bearer_token`   | `NSP_METRICS_TOKEN`         | `--metrics-bearer-token`    |
+| `metrics.refresh_ms`     | `NSP_METRICS_REFRESH_MS`    | `--metrics-refresh-ms`      |
+| `backup.enabled`         | `NSP_BACKUP`                | `--backup-enabled`          |
+| `backup.interval_secs`   | `NSP_BACKUP_INTERVAL_SECS`  | `--backup-interval-secs`    |
+| `backup.dir`             | `NSP_BACKUP_DIR`            | `--backup-dir`              |
+| `backup.retention_days`  | `NSP_BACKUP_RETENTION_DAYS` | `--backup-retention-days`   |
+
+---
+
+## Observability
+
+`/metrics` serves Prometheus text format. Wire your scraper with either:
+
+* **Bearer token** — set `NSP_METRICS_TOKEN=<secret>` and add
+  `Authorization: Bearer <secret>` to the scrape config. Recommended.
+* **Admin JWT** — leave `bearer_token` unset and the route falls through to
+  the same JWT middleware as the rest of the API.
+
+Metrics exported:
+
+```
+nsp_http_requests_total{method,status,route}
+nsp_ss_reload_total
+nsp_ss_active_users
+nsp_wg_peers
+nsp_wg_rx_bytes_total{peer,name}
+nsp_wg_tx_bytes_total{peer,name}
+nsp_wg_last_handshake_age_seconds{peer,name}
+nsp_db_pool_size
+nsp_db_pool_idle
+nsp_config_reload_total{source}
+```
+
+---
+
+## Backups
+
+`backup.enabled = true` by default. Each tick (1 h) the binary runs
+`VACUUM INTO /work/backups/nsp-YYYYMMDD-HH.sqlite`; snapshots older than
+`backup.retention_days` (7 by default) are pruned. `VACUUM INTO` runs at the
+same snapshot the pool sees, so it is safe concurrent with writes.
+
+Restore:
+
+```shell
+# Stop nsp, then:
+cp /work/backups/nsp-20260420-07.sqlite /work/data/proxy.db
+```
+
+---
+
+## Build from source
+
+Requires the Rust toolchain pinned in `rust-toolchain.toml` (currently 1.90).
+
+```shell
+# Debug
+cargo build -p nsp
+
+# Release (static musl, matches the release image)
+rustup target add x86_64-unknown-linux-musl
+RUSTFLAGS="-C target-feature=+crt-static" \
+  cargo build --release --target x86_64-unknown-linux-musl -p nsp
+```
+
+Quality gates (enforced in CI):
+
+```shell
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo deny check
+```
+
+Release image build:
+
+```shell
+docker build -f Dockerfile.release -t nsp:release .
+docker image inspect nsp:release --format '{{.Size}}'   # < 30 MB
+```
+
+## Local development
+
+`just dev` starts the backend and the Vite dev server behind a single
+origin so the SPA's `/api` calls land on the same host as the UI
+(no CORS, HMR works out of the box).
+
+It depends on [`nsiod/nsl`](https://github.com/nsiod/nsl) being
+installed and running — the one-time setup:
+
+```shell
+nsl start   # starts the nsl reverse proxy daemon
+just dev    # http://nsp.localhost:<port>/ui/
+```
+
+WireGuard / Shadowsocks / backups stay disabled in this flow, so no
+root or CAP_NET_ADMIN is needed. Protocol-level behavior still requires
+the full Docker flow.
+
+---
+
+## License
+
+MPL-2.0. See `LICENSE`.

@@ -1,0 +1,180 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-Dwarnings"
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo cranky (pedantic blocking via Cranky.toml)
+        # Mirrors Cranky.toml: pedantic + nursery + cargo lints are enabled
+        # and any warning fails the build (`-D warnings`). Clear workspace
+        # `RUSTFLAGS=-Dwarnings` to avoid double-application and ensure the
+        # allow-list from Cranky.toml is the single source of truth.
+        env:
+          RUSTFLAGS: ""
+        run: |
+          cargo clippy --workspace --all-targets -- \
+            -W clippy::pedantic \
+            -W clippy::nursery \
+            -A clippy::module_name_repetitions \
+            -A clippy::missing_errors_doc \
+            -A clippy::missing_panics_doc \
+            -A clippy::must_use_candidate \
+            -A clippy::multiple_crate_versions \
+            -A clippy::cargo_common_metadata \
+            -A clippy::cast_possible_truncation \
+            -A clippy::cast_possible_wrap \
+            -A clippy::cast_sign_loss \
+            -A clippy::cast_lossless \
+            -A clippy::cast_precision_loss \
+            -A clippy::doc_markdown \
+            -A clippy::missing_const_for_fn \
+            -A clippy::redundant_clone \
+            -A clippy::redundant_pub_crate \
+            -A clippy::option_if_let_else \
+            -A clippy::ref_option \
+            -A clippy::or_fun_call \
+            -A clippy::semicolon_if_nothing_returned \
+            -A clippy::uninlined_format_args \
+            -A clippy::too_many_lines \
+            -A clippy::unused_async \
+            -A clippy::unnecessary_wraps \
+            -A clippy::unnecessary_debug_formatting \
+            -A clippy::needless_pass_by_value \
+            -A clippy::cognitive_complexity \
+            -A clippy::use_self \
+            -A clippy::used_underscore_binding \
+            -A clippy::return_self_not_must_use \
+            -A clippy::ignored_unit_patterns \
+            -A clippy::equatable_if_let \
+            -A clippy::default_trait_access \
+            -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-features
+
+  build:
+    name: release build (musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90"
+          targets: x86_64-unknown-linux-musl
+      - name: install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@v2
+      - name: release build
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
+        run: cargo build --release --target x86_64-unknown-linux-musl -p nsp
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90"
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: cargo deny check
+        run: cargo deny check
+
+  docker:
+    name: docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - name: docker build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.release
+          push: false
+          load: true
+          provenance: false
+          sbom: false
+          tags: nsp:ci
+      - name: verify image size under 30 MB
+        run: |
+          set -euo pipefail
+          # Sum of all non-attestation layer sizes reported by `docker history`.
+          # This matches what a runtime actually needs to fetch/unpack, unlike
+          # the virtual size in `docker images` which can double-count.
+          bytes=$(docker history --format '{{.Size}}' --human=false nsp:ci \
+                    | awk '{s+=$1} END {print s}')
+          limit=$((30 * 1024 * 1024))
+          echo "image layer sum: $bytes bytes (limit $limit)"
+          if [ "$bytes" -gt "$limit" ]; then
+            echo "release image exceeds 30 MB budget"
+            exit 1
+          fi
+      - name: smoke-start container
+        run: |
+          set -euo pipefail
+          docker run -d --rm --name nsp-ci \
+            -e NSP_MASTER_KEY="$(head -c 32 /dev/urandom | base64)" \
+            -e NSP_ADMIN_PASSWORD="changeme" \
+            -p 8443:443 \
+            nsp:ci
+          ready=0
+          for i in $(seq 1 30); do
+            if curl -fsk https://localhost:8443/api/healthz >/dev/null; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" != "1" ]; then
+            echo "healthz never came up"
+            docker logs nsp-ci | head -80
+            docker rm -f nsp-ci
+            exit 1
+          fi
+          echo "healthz ok"
+          # / -> 302 /ui/
+          loc=$(curl -sk -o /dev/null -D - https://localhost:8443/ | awk -F': ' 'tolower($1)=="location"{print $2}' | tr -d '\r\n')
+          if [ "$loc" != "/ui/" ]; then
+            echo "expected / to redirect to /ui/, got '$loc'"
+            docker logs nsp-ci | head -80
+            docker rm -f nsp-ci
+            exit 1
+          fi
+          # /ui/ renders placeholder SPA
+          curl -fsk https://localhost:8443/ui/ | grep -qi nsp
+          docker logs nsp-ci | head -40
+          docker rm -f nsp-ci

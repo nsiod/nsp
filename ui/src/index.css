@@ -1,0 +1,113 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+/* Bind the `dark:` variant to the `.dark` class on the root element so
+ * ThemeProvider can drive light / dark / system without prefers-color-scheme.
+ */
+@variant dark (&:where(.dark, .dark *));
+
+@theme {
+  /* Defaults below are placeholders — the real palette lives in the
+   * :root and .dark blocks under @layer base so we can swap them at
+   * runtime.
+   */
+  --color-background: oklch(1 0 0);
+  --color-foreground: oklch(0.245 0.022 256);
+
+  --color-card: oklch(1 0 0);
+  --color-card-foreground: oklch(0.245 0.022 256);
+
+  --color-primary: oklch(0.628 0.213 255);
+  --color-primary-foreground: oklch(0.985 0 0);
+
+  --color-secondary: oklch(0.967 0.005 247);
+  --color-secondary-foreground: oklch(0.245 0.022 256);
+
+  --color-muted: oklch(0.967 0.005 247);
+  --color-muted-foreground: oklch(0.45 0.014 255);
+
+  --color-accent: oklch(0.967 0.005 247);
+  --color-accent-foreground: oklch(0.245 0.022 256);
+
+  --color-destructive: oklch(0.582 0.22 27);
+  --color-destructive-foreground: oklch(0.985 0 0);
+
+  --color-border: oklch(0.91 0.011 250);
+  --color-input: oklch(0.91 0.011 250);
+  --color-ring: oklch(0.628 0.213 255);
+
+  --radius-lg: 0.5rem;
+  --radius-md: 0.375rem;
+  --radius-sm: 0.25rem;
+
+  --font-sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+@layer base {
+  :root,
+  .light {
+    --color-background: oklch(1 0 0);
+    --color-foreground: oklch(0.245 0.022 256);
+
+    --color-card: oklch(1 0 0);
+    --color-card-foreground: oklch(0.245 0.022 256);
+
+    --color-primary: oklch(0.628 0.213 255);
+    --color-primary-foreground: oklch(0.985 0 0);
+
+    --color-secondary: oklch(0.967 0.005 247);
+    --color-secondary-foreground: oklch(0.245 0.022 256);
+
+    --color-muted: oklch(0.967 0.005 247);
+    --color-muted-foreground: oklch(0.45 0.014 255);
+
+    --color-accent: oklch(0.967 0.005 247);
+    --color-accent-foreground: oklch(0.245 0.022 256);
+
+    --color-destructive: oklch(0.582 0.22 27);
+    --color-destructive-foreground: oklch(0.985 0 0);
+
+    --color-border: oklch(0.91 0.011 250);
+    --color-input: oklch(0.91 0.011 250);
+    --color-ring: oklch(0.628 0.213 255);
+  }
+
+  .dark {
+    --color-background: oklch(0.117 0.022 256);
+    --color-foreground: oklch(0.92 0.007 250);
+
+    --color-card: oklch(0.155 0.025 256);
+    --color-card-foreground: oklch(0.92 0.007 250);
+
+    --color-primary: oklch(0.628 0.213 255);
+    --color-primary-foreground: oklch(0.117 0.022 256);
+
+    --color-secondary: oklch(0.225 0.014 250);
+    --color-secondary-foreground: oklch(0.92 0.007 250);
+
+    --color-muted: oklch(0.225 0.014 250);
+    --color-muted-foreground: oklch(0.6 0.012 255);
+
+    --color-accent: oklch(0.225 0.014 250);
+    --color-accent-foreground: oklch(0.92 0.007 250);
+
+    --color-destructive: oklch(0.582 0.22 27);
+    --color-destructive-foreground: oklch(0.985 0 0);
+
+    --color-border: oklch(0.255 0.014 250);
+    --color-input: oklch(0.255 0.014 250);
+    --color-ring: oklch(0.628 0.213 255);
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+  }
+}

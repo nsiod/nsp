@@ -1,0 +1,9 @@
+node_modules
+.vite
+.turbo
+*.log
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+.DS_Store

@@ -1,0 +1,20 @@
+/target
+/tmp
+/work
+/.sqlx
+.env
+.env.*
+!.env.example
+/data/
+
+# UI build artifacts
+/ui/node_modules
+/ui/dist/
+
+# IDE / OS
+.vscode/
+.idea/
+*.iml
+.DS_Store
+
+/.code-review-graph/

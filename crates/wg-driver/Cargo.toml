@@ -1,0 +1,46 @@
+[package]
+name = "nsp-wg-driver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "nsp_wg_driver"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Enables the Linux network-namespace integration test in
+# `tests/netns.rs`. Disabled by default because it requires root privileges.
+netns = []
+
+[dependencies]
+nsp-core = { path = "../core" }
+nsp-db = { path = "../db" }
+nsp-netctl = { path = "../netctl" }
+
+async-trait = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+gotatun = { workspace = true }
+image = { workspace = true }
+ipnetwork = { workspace = true }
+qrcode = { workspace = true }
+rand = { workspace = true }
+secrecy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+x25519-dalek = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

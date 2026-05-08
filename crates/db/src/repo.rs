@@ -82,7 +82,7 @@ fn is_unique_violation(err: &sqlx::Error) -> bool {
     match err {
         sqlx::Error::Database(db_err) => {
             let code = db_err.code();
-            matches!(code.as_deref(), Some("2067") | Some("1555") | Some("23000"))
+            matches!(code.as_deref(), Some("2067" | "1555" | "23000"))
         }
         _ => false,
     }

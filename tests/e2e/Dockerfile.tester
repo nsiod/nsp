@@ -1,0 +1,11 @@
+# Minimal tester image. Ships curl + jq + wireguard-tools so the
+# e2e suite can drive the API and verify peer state from inside the
+# isolated docker network.
+
+FROM alpine:3.20
+RUN apk add --no-cache \
+    curl jq bash bind-tools openssl \
+    wireguard-tools iproute2 iputils
+COPY run-e2e.sh /usr/local/bin/run-e2e.sh
+RUN chmod +x /usr/local/bin/run-e2e.sh
+ENTRYPOINT ["/usr/local/bin/run-e2e.sh"]

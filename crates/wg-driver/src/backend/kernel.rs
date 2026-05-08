@@ -418,7 +418,7 @@ mod tests {
     /// `#[ignore]`'d by default and intended to be run in CI under
     /// a privileged container with `cargo test -- --ignored`.
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires CAP_NET_ADMIN and the wireguard kernel module; run with `--ignored`"]
     async fn kernel_bringup_and_teardown_against_real_module() {
         if !crate::backend::kernel::has_cap_net_admin().unwrap_or(false) {
             eprintln!("skipping: CAP_NET_ADMIN missing");

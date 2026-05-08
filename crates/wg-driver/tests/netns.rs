@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use ipnetwork::Ipv4Network;
 use nsp_core::crypto::MasterKey;
-use nsp_wg_driver::{PeerCreate, WgConfig, WgDriver};
+use nsp_wg_driver::{BackendKind, PeerCreate, WgConfig, WgDriver};
 use tempfile::TempDir;
 
 fn has_cap_net_admin() -> bool {
@@ -51,6 +51,7 @@ async fn build_driver(port: u16, subnet: &str) -> (WgDriver, TempDir) {
         subnet: Some(subnet),
         endpoint_host: Some("127.0.0.1".into()),
         wan_interface: None,
+        backend: BackendKind::Userspace,
     };
     (WgDriver::new(cfg, pool, master_key), dir)
 }

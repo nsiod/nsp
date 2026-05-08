@@ -25,6 +25,7 @@ nsp-netctl = { path = "../netctl" }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
+defguard_wireguard_rs = { workspace = true }
 gotatun = { workspace = true }
 image = { workspace = true }
 ipnetwork = { workspace = true }

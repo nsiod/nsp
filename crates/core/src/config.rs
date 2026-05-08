@@ -170,6 +170,12 @@ pub struct WireguardConfig {
     /// let the driver auto-detect the default-route interface at spawn time.
     #[serde(default)]
     pub wan_interface: Option<String>,
+    /// Data-plane backend selector: `kernel` (in-kernel `wireguard`
+    /// module driven via netlink, **default**), `userspace` (in-process
+    /// gotatun + TUN), or `auto` (prefer kernel, fall back to
+    /// userspace when its preconditions are missing).
+    #[serde(default = "default_wg_backend")]
+    pub backend: String,
 }
 
 impl Default for WireguardConfig {
@@ -180,8 +186,13 @@ impl Default for WireguardConfig {
             subnet: "10.255.0.0/16".to_owned(),
             interface: "wg0".to_owned(),
             wan_interface: None,
+            backend: default_wg_backend(),
         }
     }
+}
+
+fn default_wg_backend() -> String {
+    "kernel".to_owned()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

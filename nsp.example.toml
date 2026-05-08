@@ -36,6 +36,13 @@ enabled = false
 port = 51820
 subnet = "10.255.0.0/16"
 interface = "wg0"
+# Data-plane selector. `kernel` (default) drives the in-kernel
+# wireguard module directly via netlink — no `wg`/`ip` shelling out,
+# the lowest-overhead path. Requires the kernel module loaded and
+# CAP_NET_ADMIN. `userspace` runs the in-process gotatun + TUN
+# implementation when the kernel module is unavailable. `auto` picks
+# `kernel` when its preconditions are met and otherwise falls back.
+backend = "kernel"
 
 [shadowsocks]
 enabled = false

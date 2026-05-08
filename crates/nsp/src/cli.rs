@@ -118,6 +118,11 @@ pub struct ServeArgs {
     #[arg(long, env = "NSP_WG_INTERFACE")]
     pub wireguard_interface: Option<String>,
 
+    /// Override `wireguard.backend`. Accepted values: `userspace`,
+    /// `kernel`, `auto`. Defaults to `userspace`.
+    #[arg(long, env = "NSP_WG_BACKEND")]
+    pub wireguard_backend: Option<String>,
+
     /// Override `shadowsocks.enabled`.
     #[arg(long, env = "NSP_SS")]
     pub shadowsocks_enabled: Option<bool>,
@@ -241,6 +246,9 @@ pub fn load_config(args: &ServeArgs) -> anyhow::Result<ProxyConfig> {
     }
     if let Some(ref interface) = args.wireguard_interface {
         cfg.wireguard.interface.clone_from(interface);
+    }
+    if let Some(ref backend) = args.wireguard_backend {
+        cfg.wireguard.backend.clone_from(backend);
     }
     if let Some(enabled) = args.shadowsocks_enabled {
         cfg.shadowsocks.enabled = enabled;

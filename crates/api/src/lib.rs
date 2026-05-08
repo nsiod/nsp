@@ -55,7 +55,7 @@ mod tests {
     };
     use nsp_core::{auth, crypto::MasterKey};
     use nsp_ss_driver::{SsDriver, SsDriverConfig};
-    use nsp_wg_driver::{WgConfig, WgDriver};
+    use nsp_wg_driver::{BackendKind, WgConfig, WgDriver};
     use secrecy::SecretString;
     use serde_json::Value;
     use std::net::{IpAddr, Ipv4Addr};
@@ -84,6 +84,7 @@ mod tests {
             subnet: Some("10.66.66.0/24".parse().expect("subnet")),
             endpoint_host: Some("proxy.example.com".to_owned()),
             wan_interface: None,
+            backend: BackendKind::Userspace,
         }
     }
 

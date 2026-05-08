@@ -5,7 +5,9 @@ users behind a signed API. State is a single SQLite file; secrets can be sealed
 at rest with a master key; metrics and hourly backups are built in.
 
 * **HTTP/S control plane** — JWT-auth'd REST API + embedded admin SPA.
-* **WireGuard driver** — IPAM, peer lifecycle, `wg set` apply loop.
+* **WireGuard driver** — IPAM, peer lifecycle, native netlink apply
+  loop. Pluggable data plane: in-kernel `wireguard` module via
+  netlink (default) or in-process userspace (gotatun + TUN) fallback.
 * **Shadowsocks driver** — in-process task, debounced key reloads.
 * **Optional TLS** — Let's Encrypt via `rustls-acme` (TLS-ALPN-01), static
   certs, self-signed fallback, or plaintext HTTP for local/reverse-proxy use.
@@ -157,6 +159,7 @@ and CLI flags:
 | `wireguard.port`         | `NSP_WG_PORT`               | `--wireguard-port`          |
 | `wireguard.subnet`       | `NSP_WG_SUBNET`             | `--wireguard-subnet`        |
 | `wireguard.interface`    | `NSP_WG_INTERFACE`          | `--wireguard-interface`     |
+| `wireguard.backend`      | `NSP_WG_BACKEND`            | `--wireguard-backend`       |
 | `shadowsocks.enabled`    | `NSP_SS`                    | `--shadowsocks-enabled`     |
 | `shadowsocks.bind`       | `NSP_SS_BIND`               | `--shadowsocks-bind`        |
 | `shadowsocks.port`       | `NSP_SS_PORT`               | `--shadowsocks-port`        |
@@ -170,6 +173,36 @@ and CLI flags:
 | `backup.interval_secs`   | `NSP_BACKUP_INTERVAL_SECS`  | `--backup-interval-secs`    |
 | `backup.dir`             | `NSP_BACKUP_DIR`            | `--backup-dir`              |
 | `backup.retention_days`  | `NSP_BACKUP_RETENTION_DAYS` | `--backup-retention-days`   |
+
+---
+
+## WireGuard backend
+
+The driver ships two interchangeable data-plane implementations,
+selected by `wireguard.backend` (or `NSP_WG_BACKEND`):
+
+* `kernel` *(default)* — drives the in-kernel `wireguard` module
+  **directly via netlink** (genetlink for WireGuard config + rtnetlink
+  for interface lifecycle). No `wg`, no `ip`, no shelling out: every
+  apply is one netlink round trip. Requires the `wireguard` kernel
+  module loaded (Linux ≥ 5.6 ships it in-tree) and `CAP_NET_ADMIN`.
+  Lowest CPU overhead — crypto runs in-kernel without copying packets
+  to userspace.
+* `userspace` — runs `mullvad/gotatun` in-process and exposes a
+  `tun` device. Self-contained fallback when the kernel module is
+  unavailable. Requires `/dev/net/tun` and `CAP_NET_ADMIN`.
+* `auto` — pick `kernel` when its preconditions are met, otherwise
+  fall back to `userspace`. Useful when the same image runs across
+  hosts with mixed kernel module availability.
+
+`/api/wg/status` reports the effective backend in the `backend`
+field, and the startup log emits one line distinguishing the
+requested vs effective kind.
+
+For Docker deployments the container needs `--cap-add NET_ADMIN`.
+The kernel backend additionally needs the host's `wireguard` module
+loaded (`modprobe wireguard` on the host) — no extra host binaries
+required because the netlink path bypasses `wireguard-tools` entirely.
 
 ---
 

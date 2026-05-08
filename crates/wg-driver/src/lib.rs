@@ -1,17 +1,26 @@
 //! WireGuard driver.
 //!
-//! Wraps `mullvad/gotatun` with:
+//! Wraps a pluggable data-plane backend (see [`backend::WgBackend`])
+//! with:
 //!
 //! - A server keypair persisted (encrypted) in `server_config`.
 //! - A per-`/24` IPAM allocator ([`ipam::Ipam`]).
 //! - A `wg_peers` repository bridge ([`nsp_db::WgRepo`]) storing only
 //!   each peer's public material.
 //!
+//! Two backends ship in-tree:
+//!
+//! - [`backend::UserspaceBackend`] — the original `mullvad/gotatun`
+//!   implementation. Creates a TUN device and runs WireGuard crypto
+//!   inside the process.
+//! - [`backend::KernelBackend`] — drives the in-kernel `wireguard`
+//!   module via `wg` and `ip` (the `wireguard-tools` package).
+//!
 //! The [`WgDriver`] value is a cheap handle (`Arc` internally). On
-//! [`spawn`] it loads the persisted server key, reseeds IPAM from the
-//! DB, and brings up a gotatun [`Device`] on the configured TUN
-//! interface + UDP port. The device is kept alive for the lifetime of
-//! the driver and never reconstructed; peer CRUD is live UAPI.
+//! [`spawn_real`] it loads the persisted server key, reseeds IPAM
+//! from the DB, and asks the backend to bring the interface up. The
+//! backend is kept alive for the lifetime of the driver and never
+//! reconstructed; peer CRUD goes through the live data plane.
 //!
 //! The driver does not persist a client peer's private key. Callers may
 //! supply a public key on enable / rotate, in which case the server
@@ -21,6 +30,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod backend;
 pub mod error;
 pub mod ipam;
 pub mod model;
@@ -42,15 +52,12 @@ pub(crate) mod serde_base64_pubkey_opt {
 }
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use gotatun::device::configure::PeerStats;
-use gotatun::device::{Device, Peer as GtPeer};
-use ipnetwork::{IpNetwork, Ipv4Network};
+use ipnetwork::Ipv4Network;
 use nsp_core::crypto::{DataKey, MasterKey};
 use nsp_core::driver::{Driver, DriverStatus, ProtocolKind};
 use nsp_core::reconciler::ReconcileTarget;
@@ -58,17 +65,20 @@ use nsp_db::{Pool, ServerConfigRepo, WgPeerInsert, WgPeerRow, WgRepo};
 use nsp_netctl::{IptablesManager, RuleSpec, Source};
 use rand::RngCore as _;
 use tokio::sync::{Mutex, Notify, RwLock};
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
+pub use backend::{
+    BackendBringUp, BackendKind, BackendPeer, BackendPeerStats, KernelBackend, ResolvedBackend,
+    UserspaceBackend, WgBackend,
+};
 pub use error::{Result, WgError};
 pub use ipam::{Ipam, IpamError};
 pub use model::{PeerCreate, PeerSecrets, PeerView, WgStatus};
 
-/// Transport stack used by the production driver — kernel TUN + UDP socket.
-pub type Transports = gotatun::device::DefaultDeviceTransports;
+/// Backwards-compatible alias for the userspace gotatun transport stack.
+pub type Transports = backend::userspace::Transports;
 
 const SERVER_PRIVATE_KEY: &str = "wg_server_private_key";
 const SERVER_PUBLIC_KEY: &str = "wg_server_public_key";
@@ -91,6 +101,9 @@ pub struct WgConfig {
     /// driver falls back to `/proc/net/route` autodetection, and finally to
     /// `eth0`.
     pub wan_interface: Option<String>,
+    /// Which data-plane to bring up: in-process userspace
+    /// (`gotatun`), in-kernel `wireguard` module, or auto-detect.
+    pub backend: BackendKind,
 }
 
 impl WgConfig {
@@ -117,6 +130,7 @@ impl WgConfig {
             subnet,
             endpoint_host: domain,
             wan_interface: config.wan_interface.clone(),
+            backend: BackendKind::parse(&config.backend)?,
         })
     }
 }
@@ -131,7 +145,15 @@ struct WgDriverInner {
     cfg: WgConfig,
     db: Pool,
     master_key: Arc<MasterKey>,
-    state: RwLock<Option<WgRunState>>,
+    backend: Arc<dyn WgBackend>,
+    /// Records what the operator asked for vs what was actually
+    /// brought up. Set once at construction time.
+    resolved_backend: ResolvedBackend,
+    /// Tracks whether the driver has issued a successful `up` to the
+    /// backend. The backend's own `is_running` mirrors this for its
+    /// own bookkeeping; the driver-level flag is the source of truth
+    /// for everything else (status views, reconciler triggers).
+    started: RwLock<bool>,
     /// Live subnet. Seeded from `cfg.subnet`; mutated via
     /// [`WgDriver::set_subnet`] at hot-reload time.
     subnet: RwLock<Option<Ipv4Network>>,
@@ -159,25 +181,33 @@ pub struct Availability {
 
 const AVAILABILITY_TTL: Duration = Duration::from_secs(10);
 
-/// State initialised by [`WgDriver::spawn`].
-struct WgRunState {
-    device: Arc<Device<Transports>>,
-    cancel: CancellationToken,
-}
-
 impl std::fmt::Debug for WgDriver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WgDriver")
             .field("interface", &self.inner.cfg.interface)
             .field("listen_port", &self.inner.cfg.listen_port)
+            .field("backend", &self.inner.resolved_backend.effective.label())
             .finish()
     }
 }
 
 impl WgDriver {
     /// Build a driver handle. Does not touch the network or the DB; call
-    /// [`WgDriver::spawn`] before issuing CRUD.
+    /// [`WgDriver::spawn_real`] before issuing CRUD.
     pub fn new(cfg: WgConfig, db: Pool, master_key: Arc<MasterKey>) -> Self {
+        let (backend, resolved) = backend::build(cfg.backend);
+        Self::with_backend(cfg, db, master_key, backend, resolved)
+    }
+
+    /// Construct with an explicit backend instance. Mostly useful in tests
+    /// where a mocked-out [`WgBackend`] is preferable to the real one.
+    pub fn with_backend(
+        cfg: WgConfig,
+        db: Pool,
+        master_key: Arc<MasterKey>,
+        backend: Arc<dyn WgBackend>,
+        resolved: ResolvedBackend,
+    ) -> Self {
         let subnet = cfg.subnet;
         let endpoint_host = cfg.endpoint_host.clone();
         Self {
@@ -185,7 +215,9 @@ impl WgDriver {
                 cfg,
                 db,
                 master_key,
-                state: RwLock::new(None),
+                backend,
+                resolved_backend: resolved,
+                started: RwLock::new(false),
                 subnet: RwLock::new(subnet),
                 endpoint_host: RwLock::new(endpoint_host),
                 ipam: Mutex::new(None),
@@ -228,7 +260,7 @@ impl WgDriver {
         // Refresh baseline iptables so the MASQUERADE source network
         // matches the new subnet. Best-effort: failures are logged but
         // do not abort the reload.
-        if self.inner.state.read().await.is_some() {
+        if *self.inner.started.read().await {
             if let Some(mgr) = self.inner.iptables.read().await.clone() {
                 if let Err(err) = mgr.remove_by_source(Source::WgDriver).await {
                     tracing::warn!(target: "nsp::wg", %err, "remove old baseline iptables rules");
@@ -266,6 +298,17 @@ impl WgDriver {
         &self.inner.cfg.interface
     }
 
+    /// Effective backend kind (after `auto` resolution).
+    pub fn backend_kind(&self) -> BackendKind {
+        self.inner.resolved_backend.effective
+    }
+
+    /// Backend kind originally requested by the operator — useful in
+    /// logs to flag `auto -> kernel` vs `auto -> userspace` paths.
+    pub fn requested_backend_kind(&self) -> BackendKind {
+        self.inner.resolved_backend.requested
+    }
+
     /// Attach an iptables manager. When set, `spawn_real` registers the
     /// baseline MASQUERADE + FORWARD rules under `Source::WgDriver`, and
     /// `stop` removes every rule owned by that source. Must be called before
@@ -288,10 +331,10 @@ impl WgDriver {
     }
 
     /// Load/generate the server keypair and bring up the device. Idempotent
-    /// — calling `spawn` after a successful spawn is a no-op.
-    #[tracing::instrument(skip(self), fields(iface = %self.inner.cfg.interface, port = self.inner.cfg.listen_port))]
+    /// — calling `spawn_real` after a successful spawn is a no-op.
+    #[tracing::instrument(skip(self), fields(iface = %self.inner.cfg.interface, port = self.inner.cfg.listen_port, backend = %self.backend_kind().label()))]
     pub async fn spawn_real(&self) -> Result<()> {
-        if self.inner.state.read().await.is_some() {
+        if *self.inner.started.read().await {
             return Ok(());
         }
 
@@ -301,41 +344,26 @@ impl WgDriver {
         // if the device build fails we still have a consistent in-memory view.
         self.seed_ipam().await?;
 
-        let static_secret = StaticSecret::from(*private_key_bytes);
-
         let persisted_peers = {
             let repo = WgRepo::new(&self.inner.db);
             repo.list().await?
         };
 
-        let mut builder = gotatun::device::build()
-            .with_default_udp()
-            .create_tun(&self.inner.cfg.interface)
-            .map_err(|e| {
-                WgError::Gotatun(format!("create tun `{}`: {e}", self.inner.cfg.interface))
-            })?
-            .with_private_key(static_secret)
-            .with_listen_port(self.inner.cfg.listen_port);
-
+        let mut initial = Vec::with_capacity(persisted_peers.len());
         for row in &persisted_peers {
-            let peer = peer_row_to_gotatun(row, self.data_key())?;
-            builder = builder.with_peer(peer);
+            initial.push(peer_row_to_backend(row, self.data_key())?);
         }
 
-        let device = builder
-            .build()
-            .await
-            .map_err(|e| WgError::Gotatun(format!("build device: {e}")))?;
-
-        // The runtime lifecycle is decoupled from boot-time config: the
-        // config `enabled` flag only dictates whether the caller performs the
-        // initial `spawn_real`. After boot, the API-driven start/stop pair
-        // below is the source of truth until process exit.
-        let state = WgRunState {
-            device: Arc::new(device),
-            cancel: CancellationToken::new(),
+        let bringup = BackendBringUp {
+            interface: self.inner.cfg.interface.clone(),
+            listen_port: self.inner.cfg.listen_port,
+            server_private_key: *private_key_bytes,
+            subnet: *self.inner.subnet.read().await,
+            initial_peers: initial,
         };
-        *self.inner.state.write().await = Some(state);
+        self.inner.backend.up(bringup).await?;
+
+        *self.inner.started.write().await = true;
 
         // Install baseline iptables rules after the device is live so routes
         // return sensible 503s during the brief window between TUN up and
@@ -346,6 +374,7 @@ impl WgDriver {
         tracing::info!(
             target: "nsp::wg",
             peer_count = persisted_peers.len(),
+            backend = %self.backend_kind().label(),
             "WireGuard device up"
         );
         // Wake the reconciler so any enablements queued while the
@@ -395,9 +424,10 @@ impl WgDriver {
         }
     }
 
-    /// Prepare in-memory state (IPAM + keys) without building a real TUN
-    /// device. Used by tests and by `GET /api/wg/status` smoke paths so that
-    /// the server can report sensible values even when TUN is unavailable.
+    /// Prepare in-memory state (IPAM + keys) without touching the
+    /// data plane. Used by tests and by `GET /api/wg/status` smoke
+    /// paths so that the server can report sensible values even when
+    /// the kernel module / TUN device is unavailable.
     #[tracing::instrument(skip(self), fields(iface = %self.inner.cfg.interface))]
     pub async fn prepare(&self) -> Result<()> {
         self.load_or_generate_server_keys().await?;
@@ -405,37 +435,42 @@ impl WgDriver {
         Ok(())
     }
 
-    /// Whether the TUN device is currently live. The config `enabled` flag
-    /// only controls the initial boot; after that the state reflects the
-    /// most recent `spawn_real` / `stop` pair.
+    /// Whether the data plane is currently live. The config `enabled`
+    /// flag only controls the initial boot; after that the state
+    /// reflects the most recent `spawn_real` / `stop` pair.
     pub async fn is_running(&self) -> bool {
-        self.inner.state.read().await.is_some()
+        *self.inner.started.read().await
     }
 
-    /// Bring down the gotatun `Device` and release the TUN fd. Idempotent:
-    /// repeated calls on an already-stopped driver are a no-op.
+    /// Bring the data plane down and release any kernel resources.
+    /// Idempotent: repeated calls on an already-stopped driver are a
+    /// no-op.
     ///
-    /// The runtime lifecycle is decoupled from boot-time config. Once the
-    /// API has called `stop`, the driver stays stopped (`is_running` returns
-    /// false) until an explicit `spawn_real` restarts it, regardless of what
-    /// `config.wireguard.enabled` said at startup.
+    /// The runtime lifecycle is decoupled from boot-time config. Once
+    /// the API has called `stop`, the driver stays stopped
+    /// (`is_running` returns false) until an explicit `spawn_real`
+    /// restarts it, regardless of what `config.wireguard.enabled`
+    /// said at startup.
     #[tracing::instrument(skip(self))]
     pub async fn stop(&self) -> Result<()> {
-        let state = self.inner.state.write().await.take();
-        if let Some(state) = state {
-            state.cancel.cancel();
-            // Drop the `Arc<Device>`; if nothing else is holding it the
-            // device tasks exit promptly, releasing the TUN fd.
-            drop(state.device);
-
-            if let Some(mgr) = self.inner.iptables.read().await.clone() {
-                if let Err(err) = mgr.remove_by_source(Source::WgDriver).await {
-                    tracing::warn!(target: "nsp::wg", %err, "remove baseline iptables rules failed");
-                }
-            }
-
-            tracing::info!(target: "nsp::wg", "WireGuard device stopped");
+        let was_started = {
+            let mut guard = self.inner.started.write().await;
+            let prev = *guard;
+            *guard = false;
+            prev
+        };
+        if !was_started {
+            return Ok(());
         }
+        self.inner.backend.down().await?;
+
+        if let Some(mgr) = self.inner.iptables.read().await.clone() {
+            if let Err(err) = mgr.remove_by_source(Source::WgDriver).await {
+                tracing::warn!(target: "nsp::wg", %err, "remove baseline iptables rules failed");
+            }
+        }
+
+        tracing::info!(target: "nsp::wg", "WireGuard device stopped");
         Ok(())
     }
 
@@ -443,7 +478,7 @@ impl WgDriver {
     #[tracing::instrument(skip(self))]
     pub async fn status_view(&self) -> Result<WgStatus> {
         let (_priv, public) = self.load_or_generate_server_keys().await?;
-        let running = self.inner.state.read().await.is_some();
+        let running = *self.inner.started.read().await;
         let total_peers = WgRepo::new(&self.inner.db).list().await?.len() as u64;
         let availability = self.availability().await;
         let subnet = self
@@ -464,12 +499,14 @@ impl WgDriver {
             endpoint_host,
             available: availability.available,
             reason: availability.reason,
+            backend: self.backend_kind().label().to_owned(),
         })
     }
 
-    /// Cached precondition probe. A passing probe requires a TUN device
-    /// node under `/dev/net/tun` and `CAP_NET_ADMIN` in the effective set.
-    /// Result is cached for a short TTL to avoid spamming syscalls on
+    /// Cached precondition probe. Forwards to the active backend's
+    /// availability check (TUN + CAP_NET_ADMIN for userspace; kernel
+    /// module + `wg`/`ip` + CAP_NET_ADMIN for kernel). Result is
+    /// cached for a short TTL to avoid spamming syscalls on
     /// status-polling endpoints.
     pub async fn availability(&self) -> Availability {
         {
@@ -482,13 +519,17 @@ impl WgDriver {
         }
         // Running implies the probe already succeeded at spawn, so we can
         // report available without re-syscalling.
-        let fresh = if self.inner.state.read().await.is_some() {
+        let fresh = if *self.inner.started.read().await {
             Availability {
                 available: true,
                 reason: None,
             }
         } else {
-            probe_wg_availability()
+            let probe = self.inner.backend.availability();
+            Availability {
+                available: probe.available,
+                reason: probe.reason,
+            }
         };
         *self.inner.availability_cache.write().await = Some((Instant::now(), fresh.clone()));
         fresh
@@ -615,13 +656,9 @@ impl WgDriver {
         };
         let row = WgRepo::new(&self.inner.db).insert(insert).await?;
 
-        if let Some(state) = self.inner.state.read().await.as_ref() {
-            let peer = peer_row_to_gotatun(&row, self.data_key())?;
-            state
-                .device
-                .add_or_update_peer(peer)
-                .await
-                .map_err(|e| WgError::Gotatun(format!("add peer: {e}")))?;
+        if *self.inner.started.read().await {
+            let peer = peer_row_to_backend(&row, self.data_key())?;
+            self.inner.backend.add_or_update_peer(peer).await?;
         }
 
         let stats = self.peer_stats_map().await;
@@ -720,13 +757,9 @@ impl WgDriver {
             .enable_user(user_id, insert)
             .await?;
 
-        if let Some(state) = self.inner.state.read().await.as_ref() {
-            let peer = peer_row_to_gotatun(&row, self.data_key())?;
-            state
-                .device
-                .add_or_update_peer(peer)
-                .await
-                .map_err(|e| WgError::Gotatun(format!("install peer: {e}")))?;
+        if *self.inner.started.read().await {
+            let peer = peer_row_to_backend(&row, self.data_key())?;
+            self.inner.backend.add_or_update_peer(peer).await?;
         }
 
         let stats = self.peer_stats_map().await;
@@ -748,9 +781,8 @@ impl WgDriver {
         let repo = WgRepo::new(&self.inner.db);
         let existing = repo.get_by_user(user_id).await?;
         if let Some(row) = existing.as_ref() {
-            if let Some(state) = self.inner.state.read().await.as_ref() {
-                let pk = PublicKey::from(row.public_key);
-                let _ = state.device.remove_peer(&pk).await;
+            if *self.inner.started.read().await {
+                let _ = self.inner.backend.remove_peer(&row.public_key).await;
             }
         }
         repo.disable_user(user_id).await?;
@@ -771,26 +803,26 @@ impl WgDriver {
     /// builds from DB directly.
     #[tracing::instrument(skip(self))]
     pub async fn sync_from_db(&self) -> Result<()> {
-        let device = match self.inner.state.read().await.as_ref() {
-            Some(s) => s.device.clone(),
-            None => return Ok(()),
-        };
+        if !*self.inner.started.read().await {
+            return Ok(());
+        }
 
         let rows = WgRepo::new(&self.inner.db).list().await?;
         let desired: std::collections::HashMap<[u8; 32], WgPeerRow> =
             rows.into_iter().map(|r| (r.public_key, r)).collect();
 
-        let live_keys: Vec<[u8; 32]> = device
-            .peers()
-            .await
+        let live_keys: Vec<[u8; 32]> = self
+            .inner
+            .backend
+            .list_peer_stats()
+            .await?
             .into_iter()
-            .map(|ps| ps.peer.public_key.to_bytes())
+            .map(|s| s.public_key)
             .collect();
 
         for pk_bytes in &live_keys {
             if !desired.contains_key(pk_bytes) {
-                let pk = PublicKey::from(*pk_bytes);
-                if let Err(err) = device.remove_peer(&pk).await {
+                if let Err(err) = self.inner.backend.remove_peer(pk_bytes).await {
                     tracing::warn!(target: "nsp::wg", %err, "reconcile: remove orphan peer");
                 }
             }
@@ -800,9 +832,9 @@ impl WgDriver {
             if live_keys.iter().any(|b| b == pk_bytes) {
                 continue;
             }
-            match peer_row_to_gotatun(row, self.data_key()) {
+            match peer_row_to_backend(row, self.data_key()) {
                 Ok(peer) => {
-                    if let Err(err) = device.add_or_update_peer(peer).await {
+                    if let Err(err) = self.inner.backend.add_or_update_peer(peer).await {
                         tracing::warn!(target: "nsp::wg", peer_id = %row.id, %err, "reconcile: install peer");
                     }
                 }
@@ -822,13 +854,8 @@ impl WgDriver {
             return Err(WgError::NotFound(id.to_owned()));
         };
 
-        let public_key = PublicKey::from(row.public_key);
-        if let Some(state) = self.inner.state.read().await.as_ref() {
-            state
-                .device
-                .remove_peer(&public_key)
-                .await
-                .map_err(|e| WgError::Gotatun(format!("remove peer: {e}")))?;
+        if *self.inner.started.read().await {
+            self.inner.backend.remove_peer(&row.public_key).await?;
         }
 
         if !repo.delete(id).await? {
@@ -876,15 +903,10 @@ impl WgDriver {
             .await?
             .ok_or_else(|| WgError::NotFound(old.id.clone()))?;
 
-        if let Some(state) = self.inner.state.read().await.as_ref() {
-            let old_public = PublicKey::from(old.public_key);
-            let _ = state.device.remove_peer(&old_public).await;
-            let peer = peer_row_to_gotatun(&row, self.data_key())?;
-            state
-                .device
-                .add_or_update_peer(peer)
-                .await
-                .map_err(|e| WgError::Gotatun(format!("install rotated peer: {e}")))?;
+        if *self.inner.started.read().await {
+            let _ = self.inner.backend.remove_peer(&old.public_key).await;
+            let peer = peer_row_to_backend(&row, self.data_key())?;
+            self.inner.backend.add_or_update_peer(peer).await?;
         }
 
         let stats = self.peer_stats_map().await;
@@ -947,23 +969,17 @@ impl WgDriver {
         Ok(())
     }
 
-    async fn peer_stats_map(&self) -> std::collections::HashMap<[u8; 32], PeerStats> {
-        let Some(state) = self
-            .inner
-            .state
-            .read()
-            .await
-            .as_ref()
-            .map(|s| s.device.clone())
-        else {
+    async fn peer_stats_map(&self) -> std::collections::HashMap<[u8; 32], BackendPeerStats> {
+        if !*self.inner.started.read().await {
             return Default::default();
-        };
-        state
-            .peers()
-            .await
-            .into_iter()
-            .map(|ps| (ps.peer.public_key.to_bytes(), ps))
-            .collect()
+        }
+        match self.inner.backend.list_peer_stats().await {
+            Ok(stats) => stats.into_iter().map(|s| (s.public_key, s)).collect(),
+            Err(err) => {
+                tracing::warn!(target: "nsp::wg", %err, "fetch peer stats");
+                Default::default()
+            }
+        }
     }
 
     fn data_key(&self) -> DataKey {
@@ -993,17 +1009,17 @@ impl Driver for WgDriver {
     async fn spawn(&self) -> nsp_core::Result<()> {
         // The `Driver` trait is a lightweight lifecycle hook shared with
         // `ss-driver`; we preload keys + IPAM so the API reports sensible
-        // status, but leave the TUN/UDP bring-up to the caller via
-        // `WgDriver::spawn_real`. Startup may want to degrade gracefully if
-        // TUN isn't available (e.g. unprivileged CI); the caller makes that
-        // call.
+        // status, but leave the data-plane bring-up to the caller via
+        // `WgDriver::spawn_real`. Startup may want to degrade gracefully
+        // if the kernel module / TUN isn't available (e.g. unprivileged
+        // CI); the caller makes that call.
         self.prepare()
             .await
             .map_err(|e| nsp_core::CoreError::Internal(format!("wg prepare: {e}")))
     }
 
     async fn status(&self) -> nsp_core::Result<DriverStatus> {
-        let running = self.inner.state.read().await.is_some();
+        let running = *self.inner.started.read().await;
         let active = WgRepo::new(&self.inner.db)
             .list()
             .await
@@ -1018,17 +1034,26 @@ impl Driver for WgDriver {
     }
 
     async fn shutdown(&self) -> nsp_core::Result<()> {
-        // Dropping the last `Arc<Device>` terminates the device tasks; the
-        // `WgDriver` handle goes away with `AppState` at shutdown, so
-        // clearing our state reference here releases the device.
-        *self.inner.state.write().await = None;
+        let was_started = {
+            let mut guard = self.inner.started.write().await;
+            let prev = *guard;
+            *guard = false;
+            prev
+        };
+        if was_started {
+            self.inner
+                .backend
+                .down()
+                .await
+                .map_err(|e| nsp_core::CoreError::Internal(format!("wg down: {e}")))?;
+        }
         Ok(())
     }
 }
 
 fn row_into_view(
     row: WgPeerRow,
-    stats: &std::collections::HashMap<[u8; 32], PeerStats>,
+    stats: &std::collections::HashMap<[u8; 32], BackendPeerStats>,
 ) -> Result<PeerView> {
     let ip = row
         .allowed_ip
@@ -1042,9 +1067,9 @@ fn row_into_view(
 
     let (rx_bytes, tx_bytes, last_handshake_secs) = match stats.get(&row.public_key) {
         Some(s) => (
-            s.stats.rx_bytes as u64,
-            s.stats.tx_bytes as u64,
-            s.stats.last_handshake.map(duration_to_secs),
+            s.rx_bytes,
+            s.tx_bytes,
+            s.last_handshake.map(|d| d.as_secs()),
         ),
         None => (0, 0, None),
     };
@@ -1066,30 +1091,32 @@ fn row_into_view(
     })
 }
 
-fn duration_to_secs(d: Duration) -> u64 {
-    d.as_secs()
-}
-
-fn peer_row_to_gotatun(row: &WgPeerRow, key: DataKey) -> Result<GtPeer> {
-    let public = PublicKey::from(row.public_key);
-    let allowed_ip: IpNetwork = format!("{}/32", row.allowed_ip)
+fn peer_row_to_backend(row: &WgPeerRow, key: DataKey) -> Result<BackendPeer> {
+    let allowed_ip: Ipv4Addr = row
+        .allowed_ip
         .parse()
         .map_err(|e| WgError::Invalid(format!("peer allowed_ip: {e}")))?;
-    let mut peer = GtPeer::new(public).with_allowed_ip(allowed_ip);
-    if let Some(endpoint) = row.endpoint.as_ref().and_then(|s| s.parse().ok()) {
-        peer = peer.with_endpoint(endpoint);
-    }
-    if let Some(psk_enc) = row.preshared_key_enc.as_ref() {
-        let bytes = key.open(psk_enc)?;
-        let arr = <[u8; 32]>::try_from(bytes.as_slice())
-            .map_err(|_| WgError::Invalid("PSK length != 32".into()))?;
-        peer = peer.with_preshared_key(arr);
-    }
-    if let Some(k) = row.keepalive {
-        let clamped = k.clamp(0, u16::MAX as i64) as u16;
-        peer.keepalive = Some(clamped);
-    }
-    Ok(peer)
+    let endpoint = row
+        .endpoint
+        .as_ref()
+        .and_then(|s| s.parse::<SocketAddr>().ok());
+    let preshared_key = match row.preshared_key_enc.as_ref() {
+        Some(enc) => {
+            let bytes = key.open(enc)?;
+            let arr = <[u8; 32]>::try_from(bytes.as_slice())
+                .map_err(|_| WgError::Invalid("PSK length != 32".into()))?;
+            Some(arr)
+        }
+        None => None,
+    };
+    let keepalive = row.keepalive.map(|k| k.clamp(0, u16::MAX as i64) as u16);
+    Ok(BackendPeer {
+        public_key: row.public_key,
+        allowed_ip,
+        endpoint,
+        keepalive,
+        preshared_key,
+    })
 }
 
 fn new_static_secret() -> StaticSecret {
@@ -1110,22 +1137,6 @@ fn resolve_client_keypair(
             Ok((public.to_bytes(), Some(secret.to_bytes())))
         }
     }
-}
-
-/// Read `/proc/self/status` and return whether `CAP_NET_ADMIN` (bit 12) is
-/// set in the effective capability mask. Returns `None` on non-Linux hosts
-/// or when the probe cannot read the status file.
-fn has_cap_net_admin() -> Option<bool> {
-    const CAP_NET_ADMIN_BIT: u64 = 1 << 12;
-    let data = std::fs::read_to_string("/proc/self/status").ok()?;
-    for line in data.lines() {
-        if let Some(hex) = line.strip_prefix("CapEff:") {
-            let hex = hex.trim();
-            let bits = u64::from_str_radix(hex, 16).ok()?;
-            return Some(bits & CAP_NET_ADMIN_BIT != 0);
-        }
-    }
-    None
 }
 
 /// Resolve the egress interface name. Priority:
@@ -1174,25 +1185,6 @@ async fn peer_ip_in_use(db: &Pool, ip: Ipv4Addr) -> Result<bool> {
     Ok(row.is_some())
 }
 
-fn probe_wg_availability() -> Availability {
-    if !Path::new("/dev/net/tun").exists() {
-        return Availability {
-            available: false,
-            reason: Some("tun device unavailable".to_owned()),
-        };
-    }
-    match has_cap_net_admin() {
-        Some(true) | None => Availability {
-            available: true,
-            reason: None,
-        },
-        Some(false) => Availability {
-            available: false,
-            reason: Some("CAP_NET_ADMIN missing".to_owned()),
-        },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1222,6 +1214,7 @@ mod tests {
             subnet: Some("10.66.66.0/24".parse().unwrap()),
             endpoint_host: Some("vpn.example.com".into()),
             wan_interface: None,
+            backend: BackendKind::Userspace,
         }
     }
 
@@ -1232,6 +1225,7 @@ mod tests {
             subnet: None,
             endpoint_host: Some("vpn.example.com".into()),
             wan_interface: None,
+            backend: BackendKind::Userspace,
         }
     }
 
@@ -1250,6 +1244,7 @@ mod tests {
         assert_eq!(first.server_public_key, second.server_public_key);
         assert_eq!(second.total_peers, 0);
         assert_eq!(second.subnet, "10.66.66.0/24");
+        assert_eq!(second.backend, "userspace");
     }
 
     #[tokio::test]
@@ -1510,5 +1505,31 @@ mod tests {
         driver.set_endpoint_host(None).await;
         let status = driver.status_view().await.unwrap();
         assert!(status.endpoint_host.is_none());
+    }
+
+    #[test]
+    fn from_core_parses_userspace_backend() {
+        let core = nsp_core::config::WireguardConfig {
+            backend: "userspace".into(),
+            ..Default::default()
+        };
+        let wg = WgConfig::from_core(&core, None).unwrap();
+        assert_eq!(wg.backend, BackendKind::Userspace);
+    }
+
+    #[test]
+    fn from_core_default_is_kernel() {
+        let core = nsp_core::config::WireguardConfig::default();
+        let wg = WgConfig::from_core(&core, None).unwrap();
+        assert_eq!(wg.backend, BackendKind::Kernel);
+    }
+
+    #[test]
+    fn from_core_rejects_unknown_backend() {
+        let core = nsp_core::config::WireguardConfig {
+            backend: "xdp".into(),
+            ..Default::default()
+        };
+        assert!(WgConfig::from_core(&core, None).is_err());
     }
 }

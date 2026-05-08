@@ -115,12 +115,17 @@ async fn run_serve(args: cli::ServeArgs) -> anyhow::Result<()> {
         if let Some(mgr) = iptables.clone() {
             wg.set_iptables(mgr).await;
         }
+        tracing::info!(
+            requested = wg.requested_backend_kind().label(),
+            effective = wg.backend_kind().label(),
+            "wireguard backend selected",
+        );
         match wg.spawn_real().await {
             Ok(()) => tracing::info!("wireguard driver up"),
             Err(err) => {
                 tracing::warn!(
                     %err,
-                    "wireguard spawn_real failed (likely missing NET_ADMIN); falling back to prepare-only mode"
+                    "wireguard spawn_real failed (likely missing kernel module / NET_ADMIN); falling back to prepare-only mode"
                 );
                 wg.spawn().await.context("prepare wg driver")?;
             }

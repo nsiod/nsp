@@ -81,7 +81,10 @@ zeroize = { version = "1", features = ["zeroize_derive"] }
 
 # WireGuard.
 # Pinned to mullvad/gotatun main at 9fcc37b (Merge branch 'cookie-source-port').
+# Userspace data plane (TUN + in-process crypto).
 gotatun = { git = "https://github.com/mullvad/gotatun", rev = "9fcc37b2dc4315bcadb0c59d26b93793642710d2", default-features = false, features = ["ring", "tun", "device"] }
+# Kernel data plane (in-kernel `wireguard` module via netlink + rtnetlink).
+defguard_wireguard_rs = { version = "0.9", default-features = false }
 ipnetwork = "0.21"
 qrcode = { version = "0.14", default-features = false, features = ["image"] }
 image = { version = "0.25", default-features = false, features = ["png"] }

@@ -14,6 +14,12 @@ ignore = [
     # unmaintained (upstream suggests rustls-pki-types::pem). Re-evaluate
     # when axum-server updates.
     "RUSTSEC-2025-0134",
+    # paste is pulled transitively through the netlink-packet-* crate
+    # stack used by the kernel WireGuard backend
+    # (defguard_wireguard_rs -> netlink-packet-core -> paste). Upstream
+    # alternatives exist (`pastey`) but none of the netlink crates
+    # have migrated yet.
+    "RUSTSEC-2024-0436",
 ]
 
 [licenses]

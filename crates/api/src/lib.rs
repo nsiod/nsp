@@ -771,4 +771,114 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
+
+    #[tokio::test]
+    async fn users_wg_traffic_returns_summary_and_samples() {
+        let state = test_state_full().await;
+        let tok = token(&state);
+        let id = create_user_helper(state.clone(), &tok, "ivy").await;
+
+        // Enable WG so a peer row exists.
+        let response = send(
+            state.clone(),
+            Method::POST,
+            &format!("/api/users/{id}/wg"),
+            Some(&tok),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let enabled = body_json(response).await;
+        let peer_id = enabled["peer"]["id"].as_str().expect("peer id").to_owned();
+
+        // Seed two samples in different hour buckets so the response
+        // exposes both the running totals and the time series.
+        let now = 1_700_000_000;
+        let repo = nsp_db::WgTrafficRepo::new(&state.db);
+        repo.record(&peer_id, 100, 200, Some(now), now)
+            .await
+            .unwrap();
+        repo.record(
+            &peer_id,
+            5_000,
+            6_000,
+            Some(now + 4_000),
+            now + nsp_db::TRAFFIC_BUCKET_SECS + 30,
+        )
+        .await
+        .unwrap();
+
+        let response = send(
+            state,
+            Method::GET,
+            &format!("/api/users/{id}/wg/traffic"),
+            Some(&tok),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["user_id"], id);
+        assert_eq!(body["peer_id"], peer_id);
+        assert_eq!(body["total_rx_bytes"], 5_000);
+        assert_eq!(body["total_tx_bytes"], 6_000);
+        let samples = body["samples"].as_array().expect("samples array");
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0]["rx_bytes"], 100);
+        assert_eq!(samples[0]["tx_bytes"], 200);
+        assert_eq!(samples[1]["rx_bytes"], 4_900);
+        assert_eq!(samples[1]["tx_bytes"], 5_800);
+    }
+
+    #[tokio::test]
+    async fn users_wg_traffic_404_without_peer() {
+        let state = test_state_full().await;
+        let tok = token(&state);
+        let id = create_user_helper(state.clone(), &tok, "june").await;
+        // No WG enabled -> 404.
+        let response = send(
+            state,
+            Method::GET,
+            &format!("/api/users/{id}/wg/traffic"),
+            Some(&tok),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn wg_peer_dto_includes_total_bytes_after_sample() {
+        let state = test_state_full().await;
+        let tok = token(&state);
+        let id = create_user_helper(state.clone(), &tok, "kira").await;
+        let response = send(
+            state.clone(),
+            Method::POST,
+            &format!("/api/users/{id}/wg"),
+            Some(&tok),
+            None,
+        )
+        .await;
+        let enabled = body_json(response).await;
+        let peer_id = enabled["peer"]["id"].as_str().unwrap().to_owned();
+
+        let repo = nsp_db::WgTrafficRepo::new(&state.db);
+        repo.record(&peer_id, 500, 700, None, 1_700_000_000)
+            .await
+            .unwrap();
+
+        let response = send(
+            state,
+            Method::GET,
+            &format!("/api/users/{id}/wg"),
+            Some(&tok),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["total_rx_bytes"], 500);
+        assert_eq!(body["total_tx_bytes"], 700);
+    }
 }

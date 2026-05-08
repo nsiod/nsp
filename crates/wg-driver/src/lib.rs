@@ -34,6 +34,7 @@ pub mod backend;
 pub mod error;
 pub mod ipam;
 pub mod model;
+pub mod traffic;
 
 pub(crate) mod serde_base64_pubkey_opt {
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -61,10 +62,13 @@ use ipnetwork::Ipv4Network;
 use nsp_core::crypto::{DataKey, MasterKey};
 use nsp_core::driver::{Driver, DriverStatus, ProtocolKind};
 use nsp_core::reconciler::ReconcileTarget;
-use nsp_db::{Pool, ServerConfigRepo, WgPeerInsert, WgPeerRow, WgRepo};
+use nsp_db::{Pool, ServerConfigRepo, WgPeerInsert, WgPeerRow, WgRepo, WgTrafficRepo};
+pub use nsp_db::{WgTrafficSample, WgTrafficSummary};
 use nsp_netctl::{IptablesManager, RuleSpec, Source};
 use rand::RngCore as _;
 use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
@@ -169,6 +173,15 @@ struct WgDriverInner {
     /// Reconciler wake handle. Populated once at bootstrap so the driver
     /// can wake the background task after `spawn_real` completes.
     reconcile_notify: RwLock<Option<Arc<Notify>>>,
+    /// Background traffic sampler. Spawned in `spawn_real`, cancelled
+    /// in `stop`. The cancel token and join handle are kept together
+    /// so a stop can both signal and await the loop.
+    traffic_sampler: Mutex<Option<TrafficSampler>>,
+}
+
+struct TrafficSampler {
+    cancel: CancellationToken,
+    handle: JoinHandle<()>,
 }
 
 /// Preflight precondition report. `available == false` means at least one
@@ -224,6 +237,7 @@ impl WgDriver {
                 availability_cache: RwLock::new(None),
                 iptables: RwLock::new(None),
                 reconcile_notify: RwLock::new(None),
+                traffic_sampler: Mutex::new(None),
             }),
         }
     }
@@ -370,6 +384,7 @@ impl WgDriver {
         // rules present. Failures here are logged but not fatal: the device
         // still forwards; only NAT / FORWARD policy is missing.
         self.install_baseline_rules().await;
+        self.start_traffic_sampler().await;
 
         tracing::info!(
             target: "nsp::wg",
@@ -462,6 +477,7 @@ impl WgDriver {
         if !was_started {
             return Ok(());
         }
+        self.stop_traffic_sampler().await;
         self.inner.backend.down().await?;
 
         if let Some(mgr) = self.inner.iptables.read().await.clone() {
@@ -472,6 +488,55 @@ impl WgDriver {
 
         tracing::info!(target: "nsp::wg", "WireGuard device stopped");
         Ok(())
+    }
+
+    async fn start_traffic_sampler(&self) {
+        let mut slot = self.inner.traffic_sampler.lock().await;
+        if slot.is_some() {
+            return;
+        }
+        let cancel = CancellationToken::new();
+        let handle = traffic::spawn_loop(
+            self.inner.db.clone(),
+            self.inner.backend.clone(),
+            cancel.clone(),
+        );
+        *slot = Some(TrafficSampler { cancel, handle });
+    }
+
+    async fn stop_traffic_sampler(&self) {
+        let sampler = self.inner.traffic_sampler.lock().await.take();
+        if let Some(s) = sampler {
+            s.cancel.cancel();
+            let _ = s.handle.await;
+        }
+    }
+
+    /// Take one traffic sample synchronously, bypassing the periodic
+    /// loop. Used by tests and by callers that want to force a refresh
+    /// before reading the persisted totals.
+    pub async fn sample_traffic_now(&self) -> Result<usize> {
+        traffic::sample_once(&self.inner.db, self.inner.backend.as_ref()).await
+    }
+
+    /// Cumulative traffic summary for one peer. Returns `None` when
+    /// the peer exists but has never been sampled.
+    pub async fn traffic_summary(&self, peer_id: &str) -> Result<Option<WgTrafficSummary>> {
+        Ok(WgTrafficRepo::new(&self.inner.db).get(peer_id).await?)
+    }
+
+    /// Hour-bucketed traffic samples for one peer. `since_ts = 0`
+    /// returns the full retained history. `limit <= 0` falls back to
+    /// 168 hours (one week).
+    pub async fn traffic_samples(
+        &self,
+        peer_id: &str,
+        since_ts: i64,
+        limit: i64,
+    ) -> Result<Vec<WgTrafficSample>> {
+        Ok(WgTrafficRepo::new(&self.inner.db)
+            .list_samples(peer_id, since_ts, limit)
+            .await?)
     }
 
     /// Current status snapshot for `/api/wg/status`.
@@ -541,8 +606,9 @@ impl WgDriver {
     pub async fn list_peers(&self) -> Result<Vec<PeerView>> {
         let rows = WgRepo::new(&self.inner.db).list().await?;
         let stats = self.peer_stats_map().await;
+        let totals = self.traffic_totals_map().await;
         rows.into_iter()
-            .map(|row| row_into_view(row, &stats))
+            .map(|row| row_into_view(row, &stats, &totals))
             .collect()
     }
 
@@ -554,7 +620,8 @@ impl WgDriver {
             .await?
             .ok_or_else(|| WgError::NotFound(id.to_owned()))?;
         let stats = self.peer_stats_map().await;
-        row_into_view(row, &stats)
+        let totals = self.traffic_totals_map().await;
+        row_into_view(row, &stats, &totals)
     }
 
     /// Create a new peer — generate keypair, allocate (or accept) an IP,
@@ -662,7 +729,8 @@ impl WgDriver {
         }
 
         let stats = self.peer_stats_map().await;
-        let view = row_into_view(row, &stats)?;
+        let totals = self.traffic_totals_map().await;
+        let view = row_into_view(row, &stats, &totals)?;
         Ok((
             view,
             PeerSecrets {
@@ -699,7 +767,8 @@ impl WgDriver {
         let repo = WgRepo::new(&self.inner.db);
         if let Some(row) = repo.get_by_user(user_id).await? {
             let stats = self.peer_stats_map().await;
-            let view = row_into_view(row, &stats)?;
+            let totals = self.traffic_totals_map().await;
+            let view = row_into_view(row, &stats, &totals)?;
             return Ok((view, None));
         }
 
@@ -763,7 +832,8 @@ impl WgDriver {
         }
 
         let stats = self.peer_stats_map().await;
-        let view = row_into_view(row, &stats)?;
+        let totals = self.traffic_totals_map().await;
+        let view = row_into_view(row, &stats, &totals)?;
         Ok((
             view,
             PeerSecrets {
@@ -910,7 +980,8 @@ impl WgDriver {
         }
 
         let stats = self.peer_stats_map().await;
-        let view = row_into_view(row, &stats)?;
+        let totals = self.traffic_totals_map().await;
+        let view = row_into_view(row, &stats, &totals)?;
         Ok((
             view,
             PeerSecrets {
@@ -977,6 +1048,16 @@ impl WgDriver {
             Ok(stats) => stats.into_iter().map(|s| (s.public_key, s)).collect(),
             Err(err) => {
                 tracing::warn!(target: "nsp::wg", %err, "fetch peer stats");
+                Default::default()
+            }
+        }
+    }
+
+    async fn traffic_totals_map(&self) -> std::collections::HashMap<String, WgTrafficSummary> {
+        match WgTrafficRepo::new(&self.inner.db).list_summary().await {
+            Ok(rows) => rows.into_iter().map(|s| (s.peer_id.clone(), s)).collect(),
+            Err(err) => {
+                tracing::warn!(target: "nsp::wg", %err, "load persisted traffic totals");
                 Default::default()
             }
         }
@@ -1054,6 +1135,7 @@ impl Driver for WgDriver {
 fn row_into_view(
     row: WgPeerRow,
     stats: &std::collections::HashMap<[u8; 32], BackendPeerStats>,
+    totals: &std::collections::HashMap<String, WgTrafficSummary>,
 ) -> Result<PeerView> {
     let ip = row
         .allowed_ip
@@ -1073,6 +1155,10 @@ fn row_into_view(
         ),
         None => (0, 0, None),
     };
+    let (total_rx_bytes, total_tx_bytes) = match totals.get(&row.id) {
+        Some(t) => (t.total_rx_bytes, t.total_tx_bytes),
+        None => (0, 0),
+    };
 
     Ok(PeerView {
         id: row.id,
@@ -1088,6 +1174,8 @@ fn row_into_view(
         rx_bytes,
         tx_bytes,
         last_handshake_secs,
+        total_rx_bytes,
+        total_tx_bytes,
     })
 }
 
@@ -1531,5 +1619,126 @@ mod tests {
             ..Default::default()
         };
         assert!(WgConfig::from_core(&core, None).is_err());
+    }
+
+    /// Backend stub that returns a canned `list_peer_stats` payload.
+    /// Used to drive [`traffic::sample_once`] without a live data plane.
+    #[derive(Debug)]
+    struct CannedBackend {
+        stats: tokio::sync::RwLock<Vec<BackendPeerStats>>,
+    }
+
+    impl CannedBackend {
+        fn new() -> Self {
+            Self {
+                stats: tokio::sync::RwLock::new(Vec::new()),
+            }
+        }
+
+        async fn set_stats(&self, stats: Vec<BackendPeerStats>) {
+            *self.stats.write().await = stats;
+        }
+    }
+
+    #[async_trait]
+    impl WgBackend for CannedBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Userspace
+        }
+        async fn up(&self, _params: backend::BackendBringUp) -> Result<()> {
+            Ok(())
+        }
+        async fn down(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn is_running(&self) -> bool {
+            true
+        }
+        async fn add_or_update_peer(&self, _peer: BackendPeer) -> Result<()> {
+            Ok(())
+        }
+        async fn remove_peer(&self, _public_key: &[u8; 32]) -> Result<()> {
+            Ok(())
+        }
+        async fn list_peer_stats(&self) -> Result<Vec<BackendPeerStats>> {
+            Ok(self.stats.read().await.clone())
+        }
+        fn availability(&self) -> backend::BackendAvailability {
+            backend::BackendAvailability::ok()
+        }
+    }
+
+    #[tokio::test]
+    async fn sample_traffic_now_persists_totals_and_samples() {
+        let pool = pool().await;
+        let mk = master_key();
+        let backend = Arc::new(CannedBackend::new());
+        let resolved = ResolvedBackend {
+            requested: BackendKind::Userspace,
+            effective: BackendKind::Userspace,
+        };
+        let driver = WgDriver::with_backend(
+            cfg(),
+            pool.clone(),
+            mk,
+            backend.clone() as Arc<dyn WgBackend>,
+            resolved,
+        );
+        driver.prepare().await.unwrap();
+
+        let caller_pub = [42u8; 32];
+        let (view, _) = driver
+            .add_peer(PeerCreate {
+                public_key: Some(caller_pub),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Inject a stats reading and trigger one sweep.
+        backend
+            .set_stats(vec![BackendPeerStats {
+                public_key: caller_pub,
+                rx_bytes: 1_500,
+                tx_bytes: 2_500,
+                last_handshake: Some(std::time::Duration::from_secs(30)),
+            }])
+            .await;
+        let recorded = driver.sample_traffic_now().await.unwrap();
+        assert_eq!(recorded, 1);
+
+        let summary = driver
+            .traffic_summary(&view.id)
+            .await
+            .unwrap()
+            .expect("summary present after sample");
+        assert_eq!(summary.total_rx_bytes, 1_500);
+        assert_eq!(summary.total_tx_bytes, 2_500);
+
+        let listed = driver.list_peers().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].total_rx_bytes, 1_500);
+        assert_eq!(listed[0].total_tx_bytes, 2_500);
+
+        // Second sweep with a higher counter accumulates an
+        // additional delta into the cumulative total.
+        backend
+            .set_stats(vec![BackendPeerStats {
+                public_key: caller_pub,
+                rx_bytes: 4_000,
+                tx_bytes: 5_000,
+                last_handshake: None,
+            }])
+            .await;
+        driver.sample_traffic_now().await.unwrap();
+        let summary = driver.traffic_summary(&view.id).await.unwrap().unwrap();
+        assert_eq!(summary.total_rx_bytes, 4_000);
+        assert_eq!(summary.total_tx_bytes, 5_000);
+
+        let samples = driver.traffic_samples(&view.id, 0, 10).await.unwrap();
+        // Both samples land in the same hour bucket.
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].rx_bytes, 4_000);
+        assert_eq!(samples[0].tx_bytes, 5_000);
     }
 }

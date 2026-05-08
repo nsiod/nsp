@@ -21,9 +21,9 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use nsp_db::{UserRow, UsersRepo};
+use nsp_db::{UserRow, UsersRepo, WgRepo};
 use nsp_ss_driver::SsDriver;
-use nsp_wg_driver::{PeerSecrets, PeerView, WgDriver};
+use nsp_wg_driver::{PeerSecrets, PeerView, WgDriver, WgTrafficSample, WgTrafficSummary};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -44,6 +44,7 @@ pub fn router() -> Router<Arc<AppState>> {
             get(get_wg_detail).post(enable_wg).delete(disable_wg),
         )
         .route("/:id/wg/rotate", post(rotate_wg))
+        .route("/:id/wg/traffic", get(wg_traffic))
 }
 
 pub fn protected_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
@@ -166,6 +167,12 @@ pub struct WgPeerDto {
     pub tx_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_handshake_secs: Option<u64>,
+    /// Cumulative RX bytes recorded by the traffic sampler since the
+    /// peer was first observed; survives interface and process
+    /// restarts. Zero when no sample has been taken yet.
+    pub total_rx_bytes: u64,
+    /// Cumulative TX bytes recorded by the traffic sampler.
+    pub total_tx_bytes: u64,
 }
 
 impl From<PeerView> for WgPeerDto {
@@ -184,7 +191,59 @@ impl From<PeerView> for WgPeerDto {
             rx_bytes: p.rx_bytes,
             tx_bytes: p.tx_bytes,
             last_handshake_secs: p.last_handshake_secs,
+            total_rx_bytes: p.total_rx_bytes,
+            total_tx_bytes: p.total_tx_bytes,
         }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct TrafficQuery {
+    /// Inclusive lower bound for `bucket_ts` (epoch seconds). Default
+    /// `0` means return the whole retained history.
+    #[serde(default)]
+    pub since: Option<i64>,
+    /// Maximum number of buckets to return. Default 168 (one week of
+    /// hourly buckets); capped at 10_000 by the repo.
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WgTrafficResponse {
+    pub user_id: String,
+    pub peer_id: String,
+    pub total_rx_bytes: u64,
+    pub total_tx_bytes: u64,
+    pub last_rx_seen: u64,
+    pub last_tx_seen: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_handshake_at: Option<i64>,
+    pub updated_at: i64,
+    pub samples: Vec<WgTrafficSampleDto>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WgTrafficSampleDto {
+    pub bucket_ts: i64,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+}
+
+impl From<WgTrafficSample> for WgTrafficSampleDto {
+    fn from(s: WgTrafficSample) -> Self {
+        Self {
+            bucket_ts: s.bucket_ts,
+            rx_bytes: s.rx_bytes,
+            tx_bytes: s.tx_bytes,
+        }
+    }
+}
+
+fn empty_summary(peer_id: &str) -> WgTrafficSummary {
+    WgTrafficSummary {
+        peer_id: peer_id.to_owned(),
+        ..Default::default()
     }
 }
 
@@ -490,6 +549,40 @@ async fn disable_wg(
     state.notify_reconciler();
     let pending = !d.is_running().await;
     Ok(Json(AckResponse { pending }))
+}
+
+async fn wg_traffic(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<TrafficQuery>,
+) -> Result<Json<WgTrafficResponse>, ApiError> {
+    let users = UsersRepo::new(&state.db);
+    if users.get(&id).await?.is_none() {
+        return Err(ApiError::NotFound);
+    }
+    let peer = WgRepo::new(&state.db)
+        .get_by_user(&id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let d = wg_driver(&state)?;
+    let summary = d
+        .traffic_summary(&peer.id)
+        .await?
+        .unwrap_or_else(|| empty_summary(&peer.id));
+    let samples = d
+        .traffic_samples(&peer.id, q.since.unwrap_or(0), q.limit.unwrap_or(168))
+        .await?;
+    Ok(Json(WgTrafficResponse {
+        user_id: id,
+        peer_id: peer.id,
+        total_rx_bytes: summary.total_rx_bytes,
+        total_tx_bytes: summary.total_tx_bytes,
+        last_rx_seen: summary.last_rx_seen,
+        last_tx_seen: summary.last_tx_seen,
+        last_handshake_at: summary.last_handshake_at,
+        updated_at: summary.updated_at,
+        samples: samples.into_iter().map(WgTrafficSampleDto::from).collect(),
+    }))
 }
 
 async fn rotate_wg(

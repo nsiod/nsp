@@ -1155,7 +1155,7 @@ fn row_into_view(
         ),
         None => (0, 0, None),
     };
-    let (total_rx_bytes, total_tx_bytes) = match totals.get(&row.id) {
+    let (total_rx, total_tx) = match totals.get(&row.id) {
         Some(t) => (t.total_rx_bytes, t.total_tx_bytes),
         None => (0, 0),
     };
@@ -1174,8 +1174,8 @@ fn row_into_view(
         rx_bytes,
         tx_bytes,
         last_handshake_secs,
-        total_rx_bytes,
-        total_tx_bytes,
+        total_rx_bytes: total_rx,
+        total_tx_bytes: total_tx,
     })
 }
 

@@ -75,15 +75,11 @@ fn tuple_to_summary(t: SummaryTuple) -> WgTrafficSummary {
     }
 }
 
-/// Floor `now` to the start of its hour bucket.
+/// Floor `now` to the start of its hour bucket. `rem_euclid` always returns
+/// a non-negative remainder, so this works for both positive and negative
+/// epochs (the latter is not expected in production).
 pub fn bucket_for(now: i64) -> i64 {
-    if now >= 0 {
-        now - now.rem_euclid(TRAFFIC_BUCKET_SECS)
-    } else {
-        // Negative epochs are not expected in production; the explicit
-        // branch keeps the math well-defined for tests.
-        now - (now.rem_euclid(TRAFFIC_BUCKET_SECS))
-    }
+    now - now.rem_euclid(TRAFFIC_BUCKET_SECS)
 }
 
 impl<'a> WgTrafficRepo<'a> {

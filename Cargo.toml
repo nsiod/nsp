@@ -97,6 +97,11 @@ metrics-exporter-prometheus = { version = "0.17", default-features = false }
 # to match the rustls provider used everywhere else.
 rustls-acme = { version = "0.14", default-features = false, features = ["ring", "tls12", "tokio", "axum", "webpki-roots"] }
 
+# Outbound HTTP client used by the control-center poller. Pinned to
+# rustls + webpki-roots without a default crypto provider so the binary
+# keeps using the same `ring` provider installed elsewhere.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "http2"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

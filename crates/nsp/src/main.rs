@@ -8,6 +8,7 @@
 
 mod backup;
 mod cli;
+mod control;
 mod observability;
 mod server;
 mod tls;
@@ -53,6 +54,12 @@ async fn run_serve(args: cli::ServeArgs) -> anyhow::Result<()> {
     let mut config = cli::load_config(&args).context("load config")?;
     tracing_init::init(&config.logging).context("init tracing")?;
     tracing::info!(version = VERSION, "nsp starting");
+
+    // Install the rustls `ring` provider once, up front. The TLS listener
+    // builder also calls this lazily, but the control-center poller's
+    // reqwest client needs a default provider available before its first
+    // request, regardless of whether inbound TLS is enabled.
+    tls::install_default_crypto_provider();
 
     // Install the Prometheus recorder as early as possible so subsequent
     // metric calls (e.g. driver start-up counters) find a recorder.
@@ -136,12 +143,25 @@ async fn run_serve(args: cli::ServeArgs) -> anyhow::Result<()> {
         None
     };
 
+    // The api lockdown switch and the control-center poller are
+    // **independent**. Log both up front so an operator can
+    // immediately see which combination is in effect without
+    // hunting through later log lines. See `docs/api-lockdown.md`
+    // for all six valid combinations.
+    tracing::info!(
+        api = ?config.security.api,
+        listener_will_bind = config.security.api.binds_listener(),
+        control_enabled = config.control.enabled,
+        "admin surface configured",
+    );
+
     let mut app_state = nsp_api::AppState::new(
         pool.clone(),
         master_key.clone(),
         config.security.jwt_ttl_secs,
         VERSION,
-    );
+    )
+    .with_api_mode(config.security.api);
     if let Some(wg) = wg.clone() {
         app_state = app_state.with_wg(wg);
     }
@@ -191,22 +211,12 @@ async fn run_serve(args: cli::ServeArgs) -> anyhow::Result<()> {
     app_state = app_state.with_reconciler(reconciler);
 
     let state = Arc::new(app_state);
-    let router = nsp_api::router(state.clone());
+    let bind_listener = config.security.api.binds_listener();
 
-    // Wire HTTP request counters + /metrics route (additively).
-    let router = router.layer(axum::middleware::from_fn(observability::track_http));
-    let router = if obs.enabled {
-        observability::attach_metrics_route(
-            router,
-            obs.handle.clone(),
-            obs.auth.clone(),
-            state.clone(),
-        )
-    } else {
-        router
-    };
-
-    // Start gauge refresher once drivers are up.
+    // Start gauge refresher once drivers are up. Independent of
+    // the listener: gauges feed the in-process Prometheus recorder
+    // either way; the `/metrics` route is only attached below when
+    // we're actually binding a listener to expose it.
     if obs.enabled {
         obs.spawn_refresher(pool.clone(), ss_driver.clone(), wg.clone())
             .context("spawn metrics refresher")?;
@@ -226,18 +236,68 @@ async fn run_serve(args: cli::ServeArgs) -> anyhow::Result<()> {
         None
     };
 
-    let acceptor = tls::build(&config.http, &config.tls)
-        .await
-        .context("listener setup")?;
-    tracing::info!(
-        mode = acceptor.kind(),
-        protocol = acceptor.protocol(),
-        "listener mode selected"
+    // Reverse-API control-center poller. Each tick POSTs a
+    // self-report (cursor + content hashes + service state) and
+    // reconciles the response into local DB + iptables. Disabled by
+    // default; enabled with NSP_CONTROL=true plus URL/NODE_ID/TOKEN.
+    // See docs/control-center.md for the full protocol. **Note:**
+    // independent of `security.api` — either, both, or
+    // neither can be on.
+    let control_task = control::spawn(
+        pool.clone(),
+        config.control.clone(),
+        state.reconciler.clone(),
+        iptables.clone(),
+        ss_driver.clone(),
+        wg.clone(),
     );
 
-    let result = server::serve(config.http.listen, acceptor, router, pool, ss_driver, wg).await;
+    let result = if bind_listener {
+        // Build the router only when we'll actually bind a
+        // listener. In `Disabled` mode the entire router (and the
+        // metrics route, and the SPA static assets) is skipped so
+        // there is genuinely nothing inbound on this process.
+        let router = nsp_api::router(state.clone());
+        let router = router.layer(axum::middleware::from_fn(observability::track_http));
+        let router = if obs.enabled {
+            observability::attach_metrics_route(
+                router,
+                obs.handle.clone(),
+                obs.auth.clone(),
+                state.clone(),
+            )
+        } else {
+            router
+        };
+
+        let acceptor = tls::build(&config.http, &config.tls)
+            .await
+            .context("listener setup")?;
+        tracing::info!(
+            mode = acceptor.kind(),
+            protocol = acceptor.protocol(),
+            api = ?config.security.api,
+            "listener mode selected",
+        );
+        server::serve(config.http.listen, acceptor, router, pool, ss_driver, wg).await
+    } else {
+        // Headless mode (`api = "disabled"`): no router, no
+        // listener, no port bound. `nmap` / `ss -lntp` will not see
+        // the admin port at all. The process is kept alive by the
+        // background tasks (control poller, backup, metrics
+        // refresher) until SIGINT/SIGTERM. This decision is purely
+        // local — independent of whether the control center is
+        // configured. A node with `NSP_CONTROL=false` and
+        // `NSP_API=disabled` runs as a passive data plane with no
+        // admin channel at all (legitimate, if unusual).
+        tracing::info!("api=disabled — listener not bound; admin port is not present on this host");
+        server::wait_for_shutdown_signal(pool, ss_driver, wg).await
+    };
 
     if let Some(t) = backup_task {
+        t.abort();
+    }
+    if let Some(t) = control_task {
         t.abort();
     }
 

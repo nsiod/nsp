@@ -133,6 +133,7 @@ Key sections:
 | `shadowsocks` | SS bind, port, apply debounce            |
 | `metrics`     | Enable `/metrics`, optional bearer token |
 | `backup`      | Dir, interval, retention                 |
+| `control`     | Reverse-API control-center poller        |
 
 Common settings use the same config path across TOML, environment variables,
 and CLI flags:
@@ -155,6 +156,7 @@ and CLI flags:
 | `security.allow_insecure_no_master_key` | `NSP_ALLOW_INSECURE_NO_MASTER_KEY` | `--allow-insecure-no-master-key` |
 | `security.admin_password` | `NSP_ADMIN_PASSWORD`        | `--security-admin-password` |
 | `security.jwt_ttl_secs`  | `NSP_JWT_TTL`               | `--security-jwt-ttl-secs`   |
+| `security.api`           | `NSP_API`                   | `--security-api`            |
 | `wireguard.enabled`      | `NSP_WG`                    | `--wireguard-enabled`       |
 | `wireguard.port`         | `NSP_WG_PORT`               | `--wireguard-port`          |
 | `wireguard.subnet`       | `NSP_WG_SUBNET`             | `--wireguard-subnet`        |
@@ -173,6 +175,14 @@ and CLI flags:
 | `backup.interval_secs`   | `NSP_BACKUP_INTERVAL_SECS`  | `--backup-interval-secs`    |
 | `backup.dir`             | `NSP_BACKUP_DIR`            | `--backup-dir`              |
 | `backup.retention_days`  | `NSP_BACKUP_RETENTION_DAYS` | `--backup-retention-days`   |
+| `control.enabled`        | `NSP_CONTROL`               | `--control-enabled`         |
+| `control.url`            | `NSP_CONTROL_URL`           | `--control-url`             |
+| `control.token`          | `NSP_CONTROL_TOKEN`         | `--control-token`           |
+| `control.node_id`        | `NSP_CONTROL_NODE_ID`       | `--control-node-id`         |
+| `control.interval_secs`  | `NSP_CONTROL_INTERVAL_SECS` | `--control-interval-secs`   |
+| `control.timeout_secs`   | `NSP_CONTROL_TIMEOUT_SECS`  | `--control-timeout-secs`    |
+| `control.status_interval_secs` | `NSP_CONTROL_STATUS_INTERVAL_SECS` | `--control-status-interval-secs` |
+| `control.conflict_policy`| `NSP_CONTROL_CONFLICT_POLICY` | `--control-conflict-policy` |
 
 ---
 
@@ -245,6 +255,25 @@ Restore:
 # Stop nsp, then:
 cp /work/backups/nsp-20260420-07.sqlite /work/data/proxy.db
 ```
+
+---
+
+## Reverse API (control center)
+
+Set `NSP_CONTROL=true` together with `NSP_CONTROL_URL`,
+`NSP_CONTROL_NODE_ID`, and `NSP_CONTROL_TOKEN` to have nsp run as a
+node managed by a remote control plane. Each tick the node POSTs a
+self-report (cursor + content hashes for settings/users/iptables +
+service running state) and applies the reconcile directives in the
+response — no separate heartbeat needed.
+
+The control center can drive **all** node configuration this way:
+the singleton settings row, the user list (full or delta), and the
+control-source iptables rules.
+
+The full protocol — request/response shape, sync modes (`merge` vs
+`replace`), reset signal, hashing rules, and a server-side decision
+tree — is in [`docs/control-center.md`](./docs/control-center.md).
 
 ---
 

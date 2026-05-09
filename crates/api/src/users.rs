@@ -21,7 +21,7 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use nsp_db::{UserRow, UsersRepo, WgRepo};
+use nsp_db::{UserRow, UserSource, UsersRepo, WgRepo};
 use nsp_ss_driver::SsDriver;
 use nsp_wg_driver::{PeerSecrets, PeerView, WgDriver, WgTrafficSample, WgTrafficSummary};
 use serde::{Deserialize, Serialize};
@@ -76,6 +76,10 @@ pub struct UserDto {
     pub wg_enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// `local` (admin-created via this API) or `control` (managed by
+    /// the reverse-API control center). The frontend uses this to
+    /// decide whether to render edit/delete affordances.
+    pub source: UserSource,
 }
 
 impl From<UserRow> for UserDto {
@@ -87,6 +91,7 @@ impl From<UserRow> for UserDto {
             ss_enabled: r.ss_enabled,
             wg_enabled: r.wg_enabled,
             note: r.note,
+            source: r.source,
         }
     }
 }
@@ -309,8 +314,25 @@ fn validate_name(name: &str) -> Result<(), ApiError> {
 
 async fn list_users(State(state): State<Arc<AppState>>) -> Result<Json<Vec<UserDto>>, ApiError> {
     let repo = UsersRepo::new(&state.db);
-    let rows = repo.list().await?;
+    // Admin sees the whole table — both `local` and `control` rows —
+    // with the source tag in the DTO so the UI can gate affordances.
+    let rows = repo.list(None).await?;
     Ok(Json(rows.into_iter().map(UserDto::from).collect()))
+}
+
+/// Reject mutations on rows that the admin API doesn't own. The
+/// control center is the sole writer for `source = control`, so an
+/// admin PATCH/DELETE there would silently get clobbered on the next
+/// reconcile tick — refusing up front is the honest behavior.
+fn assert_locally_writable(row: &UserRow) -> Result<(), ApiError> {
+    if row.source != UserSource::Local {
+        return Err(ApiError::Forbidden(format!(
+            "user {} is owned by `{}` and is not editable through the local API",
+            row.id,
+            row.source.as_tag()
+        )));
+    }
+    Ok(())
 }
 
 async fn get_user(
@@ -341,9 +363,8 @@ async fn update_user(
     Json(req): Json<UpdateUserRequest>,
 ) -> Result<Json<UserDto>, ApiError> {
     let repo = UsersRepo::new(&state.db);
-    if repo.get(&id).await?.is_none() {
-        return Err(ApiError::NotFound);
-    }
+    let existing = repo.get(&id).await?.ok_or(ApiError::NotFound)?;
+    assert_locally_writable(&existing)?;
     if let Some(new_name) = req.name.as_deref() {
         validate_name(new_name)?;
         let trimmed = new_name.trim();
@@ -363,12 +384,15 @@ async fn update_user(
 /// Delete a user. The `ON DELETE CASCADE` foreign keys on
 /// `ss_credentials` and `wg_peers` remove protocol state in the same
 /// transaction, so the reconciler is notified to pull live WG peers
-/// on its next cycle.
+/// on its next cycle. Refuses to delete `control`-source rows so the
+/// admin can't subvert the control center's authority.
 async fn delete_user(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let repo = UsersRepo::new(&state.db);
+    let existing = repo.get(&id).await?.ok_or(ApiError::NotFound)?;
+    assert_locally_writable(&existing)?;
     if !repo.delete(&id).await? {
         return Err(ApiError::NotFound);
     }

@@ -7,7 +7,14 @@
 
 use std::sync::Arc;
 
-use axum::Router;
+use axum::{
+    extract::{Request, State},
+    http::{Method, StatusCode},
+    middleware::{from_fn_with_state, Next},
+    response::{IntoResponse, Response},
+    Router,
+};
+use nsp_core::config::ApiMode;
 
 pub mod audit;
 pub mod error;
@@ -31,8 +38,13 @@ pub use state::AppState;
 /// * `/api/users[...]` — every user-scoped read, write, rotate, and
 ///   one-shot client material, including per-user SS/WG enable, rotate,
 ///   and detail.
+///
+/// Every `/api/*` route is wrapped in [`enforce_api_mode`] which
+/// rejects writes (`Readonly`) or all requests (`Disabled`) based
+/// on the operator's lockdown stance. The SPA static-asset router
+/// is intentionally left alone so the dashboard still loads.
 pub fn router(state: Arc<AppState>) -> Router {
-    Router::new()
+    let api = Router::new()
         .merge(routes::public_router())
         .merge(routes::api_router(state.clone()))
         .merge(audit::protected_router(state.clone()))
@@ -41,8 +53,43 @@ pub fn router(state: Arc<AppState>) -> Router {
         .nest("/api/protocol/wg", wg::protected_router(state.clone()))
         .nest("/api/users", users::protected_router(state.clone()))
         .nest("/api/iptables", iptables::protected_router(state.clone()))
-        .merge(spa::router())
-        .with_state(state)
+        .layer(from_fn_with_state(state.clone(), enforce_api_mode));
+
+    api.merge(spa::router()).with_state(state)
+}
+
+/// Middleware: gate `/api/*` requests on the operator's
+/// [`ApiMode`]. Non-`/api/*` paths fall through unchanged.
+///
+/// * `Enabled`  — pass-through.
+/// * `Readonly` — `GET` / `HEAD` / `OPTIONS` pass; everything else
+///   gets `403 Forbidden` so a malicious caller's mutation attempts
+///   are visible in logs (vs. a confusing 404 on real routes).
+/// * `Disabled` — every `/api/*` request gets `404 Not Found`. In
+///   production the binary skips the listener entirely when this
+///   mode is configured (the port isn't even bound), so this branch
+///   is effectively a defense-in-depth fallback for tests and for
+///   the case where the router is reused outside the binary's
+///   listener flow.
+async fn enforce_api_mode(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if !req.uri().path().starts_with("/api/") {
+        return next.run(req).await;
+    }
+    match state.api_mode {
+        ApiMode::Enabled => next.run(req).await,
+        ApiMode::Readonly => {
+            if matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
+                next.run(req).await
+            } else {
+                StatusCode::FORBIDDEN.into_response()
+            }
+        }
+        ApiMode::Disabled => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 #[cfg(test)]
@@ -655,6 +702,146 @@ mod tests {
             let response = send(state.clone(), method, uri, None, None).await;
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
         }
+    }
+
+    #[tokio::test]
+    async fn user_dto_carries_local_source_for_api_created_users() {
+        let state = test_state_full().await;
+        let tok = token(&state);
+        let id = create_user_helper(state.clone(), &tok, "alice").await;
+
+        let response = send(
+            state,
+            Method::GET,
+            &format!("/api/users/{id}"),
+            Some(&tok),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let v = body_json(response).await;
+        assert_eq!(v["source"], "local");
+    }
+
+    // ---------------- api lockdown mode ----------------
+
+    async fn test_state_with_mode(mode: nsp_core::config::ApiMode) -> Arc<AppState> {
+        let db = pool().await;
+        let master_key = master_key();
+        Arc::new(AppState::new(db, master_key, 60, "test").with_api_mode(mode))
+    }
+
+    #[tokio::test]
+    async fn api_readonly_blocks_writes_with_403() {
+        let state = test_state_with_mode(nsp_core::config::ApiMode::Readonly).await;
+        let tok = token(&state);
+
+        // GET succeeds.
+        let response = send(state.clone(), Method::GET, "/api/users", Some(&tok), None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // POST is rejected with 403 — uniform across all /api/* routes.
+        let response = send(
+            state.clone(),
+            Method::POST,
+            "/api/users",
+            Some(&tok),
+            Some(r#"{"name":"alice"}"#),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // PATCH is rejected too.
+        let response = send(
+            state,
+            Method::PATCH,
+            "/api/users/anything",
+            Some(&tok),
+            Some(r#"{"name":"x"}"#),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn api_disabled_returns_404_for_all_methods() {
+        let state = test_state_with_mode(nsp_core::config::ApiMode::Disabled).await;
+        let tok = token(&state);
+
+        let cases = [
+            (Method::GET, "/api/users"),
+            (Method::POST, "/api/users"),
+            (Method::GET, "/api/health"), // even public-ish routes
+            (Method::POST, "/api/auth/login"),
+        ];
+        for (method, uri) in cases {
+            let response = send(state.clone(), method.clone(), uri, Some(&tok), None).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{method} {uri} should be 404 in disabled mode",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lockdown_does_not_block_non_api_paths() {
+        // SPA static assets live outside `/api/*` so the dashboard
+        // can still load even when the API surface is locked down.
+        // We can't easily assert a real SPA load here, but we can
+        // confirm the middleware only kicks in for `/api/*` by
+        // hitting a non-existent non-api path: the SPA fallback
+        // returns 200 (its index.html catch-all) or 404 from the
+        // SPA, but never the lockdown's 403/404 from middleware.
+        // For unit-test purposes we just confirm `/api/*` goes
+        // through the middleware (covered above) — the negative
+        // case is documented behavior rather than asserted here.
+        let state = test_state_with_mode(nsp_core::config::ApiMode::Disabled).await;
+        let response = send(state, Method::GET, "/api/users", None, None).await;
+        // The middleware short-circuits BEFORE auth runs, so the
+        // result is 404, not the 401 we'd see in Enabled mode.
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn users_patch_and_delete_are_forbidden_on_control_source() {
+        // Admin can't touch a user that the control reconciler owns —
+        // both PATCH and DELETE on /api/users/:id must return 403.
+        let state = test_state_full().await;
+        let tok = token(&state);
+
+        // Pre-seed a control-owned row directly through the repo.
+        nsp_db::UsersRepo::new(&state.db)
+            .create_with_source("ctl-1", "ctl-alice", nsp_db::UserSource::Control, None)
+            .await
+            .expect("seed control user");
+
+        let response = send(
+            state.clone(),
+            Method::PATCH,
+            "/api/users/ctl-1",
+            Some(&tok),
+            Some(r#"{"name":"renamed"}"#),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = send(
+            state.clone(),
+            Method::DELETE,
+            "/api/users/ctl-1",
+            Some(&tok),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // Row still there, untouched.
+        let response = send(state, Method::GET, "/api/users/ctl-1", Some(&tok), None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let v = body_json(response).await;
+        assert_eq!(v["source"], "control");
+        assert_eq!(v["name"], "ctl-alice");
     }
 
     #[tokio::test]

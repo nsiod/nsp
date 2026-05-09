@@ -36,6 +36,31 @@ pub async fn serve(
     tracing::info!(%addr, kind = acceptor.kind(), protocol = acceptor.protocol(), "listening");
     let result = crate::tls::serve(addr, acceptor, handle, router).await;
 
+    shutdown_runtime(pool, ss, wg).await;
+    result
+}
+
+/// Headless variant: no HTTP listener. Block until SIGINT/SIGTERM
+/// and then run the same driver/pool teardown as [`serve`] so the
+/// process exits cleanly. Used when `security.api = "disabled"`
+/// — the operator administers the node exclusively through the
+/// reverse-API control center, so the local admin port isn't even
+/// bound (one less attack surface).
+pub async fn wait_for_shutdown_signal(
+    pool: Pool,
+    ss: Option<SsDriver>,
+    wg: Option<WgDriver>,
+) -> anyhow::Result<()> {
+    if let Err(err) = wait_for_signal().await {
+        tracing::error!(?err, "signal listener failed");
+    } else {
+        tracing::info!("shutdown signal received; tearing down headless node");
+    }
+    shutdown_runtime(pool, ss, wg).await;
+    Ok(())
+}
+
+async fn shutdown_runtime(pool: Pool, ss: Option<SsDriver>, wg: Option<WgDriver>) {
     tracing::info!("shutting down drivers");
     if let Some(ss) = ss {
         if let Err(err) = ss.shutdown().await {
@@ -52,7 +77,6 @@ pub async fn serve(
     pool.close().await;
 
     tracing::info!("bye");
-    result
 }
 
 #[cfg(unix)]

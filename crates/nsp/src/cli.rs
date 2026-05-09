@@ -11,7 +11,7 @@ use figment::{
     providers::{Format, Serialized, Toml},
     Figment,
 };
-use nsp_core::config::ProxyConfig;
+use nsp_core::config::{ApiMode, ConflictPolicy, ProxyConfig};
 use secrecy::SecretString;
 
 #[derive(Debug, Parser)]
@@ -102,6 +102,14 @@ pub struct ServeArgs {
     #[arg(long, env = "NSP_ALLOW_INSECURE_NO_MASTER_KEY")]
     pub allow_insecure_no_master_key: Option<bool>,
 
+    /// Override `security.api`. `enabled` (default) is the full
+    /// read/write admin surface; `readonly` blocks all writes;
+    /// `disabled` skips the listener bind entirely. This is a
+    /// purely local operator decision, independent of the
+    /// reverse-API control center.
+    #[arg(long, env = "NSP_API", value_enum)]
+    pub security_api: Option<ApiMode>,
+
     /// Override `wireguard.enabled`.
     #[arg(long, env = "NSP_WG")]
     pub wireguard_enabled: Option<bool>,
@@ -174,6 +182,46 @@ pub struct ServeArgs {
     /// Override `backup.retention_days`.
     #[arg(long, env = "NSP_BACKUP_RETENTION_DAYS")]
     pub backup_retention_days: Option<u32>,
+
+    /// Override `control.enabled`. When true, nsp polls the configured
+    /// control center for settings + user snapshots.
+    #[arg(long, env = "NSP_CONTROL")]
+    pub control_enabled: Option<bool>,
+
+    /// Override `control.url`. Base URL of the control center, e.g.
+    /// `https://control.example.com`.
+    #[arg(long, env = "NSP_CONTROL_URL")]
+    pub control_url: Option<String>,
+
+    /// Override `control.token`. Bearer token sent to the control center.
+    #[arg(long, env = "NSP_CONTROL_TOKEN")]
+    pub control_token: Option<String>,
+
+    /// Override `control.node_id`. Logical identifier of this node.
+    #[arg(long, env = "NSP_CONTROL_NODE_ID")]
+    pub control_node_id: Option<String>,
+
+    /// Override `control.interval_secs`.
+    #[arg(long, env = "NSP_CONTROL_INTERVAL_SECS")]
+    pub control_interval_secs: Option<u64>,
+
+    /// Override `control.timeout_secs`.
+    #[arg(long, env = "NSP_CONTROL_TIMEOUT_SECS")]
+    pub control_timeout_secs: Option<u64>,
+
+    /// Override `control.status_interval_secs`. Cadence of the
+    /// `POST /status` observability reports. Defaults to the same
+    /// value as `interval_secs`.
+    #[arg(long, env = "NSP_CONTROL_STATUS_INTERVAL_SECS")]
+    pub control_status_interval_secs: Option<u64>,
+
+    /// Override `control.conflict_policy`. Decides what happens to
+    /// local resources (users, control-source iptables rules) that
+    /// the server didn't include in a Full snapshot. `keep` (default)
+    /// preserves them; `prune` deletes them. Server-driven
+    /// `mode: "replace"` always wins per response.
+    #[arg(long, env = "NSP_CONTROL_CONFLICT_POLICY", value_enum)]
+    pub control_conflict_policy: Option<ConflictPolicy>,
 }
 
 /// Merge defaults -> TOML (if present) -> env-backed CLI args -> CLI overrides.
@@ -235,6 +283,9 @@ pub fn load_config(args: &ServeArgs) -> anyhow::Result<ProxyConfig> {
     if let Some(allow) = args.allow_insecure_no_master_key {
         cfg.security.allow_insecure_no_master_key = allow;
     }
+    if let Some(mode) = args.security_api {
+        cfg.security.api = mode;
+    }
     if let Some(enabled) = args.wireguard_enabled {
         cfg.wireguard.enabled = enabled;
     }
@@ -288,6 +339,30 @@ pub fn load_config(args: &ServeArgs) -> anyhow::Result<ProxyConfig> {
     }
     if let Some(days) = args.backup_retention_days {
         cfg.backup.retention_days = days;
+    }
+    if let Some(enabled) = args.control_enabled {
+        cfg.control.enabled = enabled;
+    }
+    if let Some(ref url) = args.control_url {
+        cfg.control.url = Some(url.clone());
+    }
+    if let Some(ref token) = args.control_token {
+        cfg.control.token = Some(SecretString::from(token.clone()));
+    }
+    if let Some(ref id) = args.control_node_id {
+        cfg.control.node_id = Some(id.clone());
+    }
+    if let Some(secs) = args.control_interval_secs {
+        cfg.control.interval_secs = secs;
+    }
+    if let Some(secs) = args.control_timeout_secs {
+        cfg.control.timeout_secs = secs;
+    }
+    if let Some(secs) = args.control_status_interval_secs {
+        cfg.control.status_interval_secs = secs;
+    }
+    if let Some(policy) = args.control_conflict_policy {
+        cfg.control.conflict_policy = policy;
     }
     Ok(cfg)
 }

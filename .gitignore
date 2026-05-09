@@ -11,6 +11,10 @@
 /ui/node_modules
 /ui/dist/
 
+# e2e Bun deps + per-run JUnit report
+/tests/e2e/node_modules
+/tests/e2e/results
+
 # IDE / OS
 .vscode/
 .idea/

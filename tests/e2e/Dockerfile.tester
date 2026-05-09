@@ -1,11 +1,44 @@
-# Minimal tester image. Ships curl + jq + wireguard-tools so the
-# e2e suite can drive the API and verify peer state from inside the
-# isolated docker network.
+# Tester image. Ships Bun (TypeScript runtime + test runner) along
+# with the kernel-side tooling the data-plane phase needs:
+# `wireguard-tools` for `wg`/`wg genkey`, `iproute2` for `ip`,
+# `iputils` for `ping`, `bind-tools` for `getent hosts`, `openssl`
+# for ad-hoc randomness.
+#
+# Pinned to the same Bun release as the UI workspace.
+FROM oven/bun:1.3.12-alpine
 
-FROM alpine:3.20
 RUN apk add --no-cache \
-    curl jq bash bind-tools openssl \
-    wireguard-tools iproute2 iputils
-COPY run-e2e.sh /usr/local/bin/run-e2e.sh
-RUN chmod +x /usr/local/bin/run-e2e.sh
-ENTRYPOINT ["/usr/local/bin/run-e2e.sh"]
+        bash \
+        bind-tools \
+        iproute2 \
+        iputils \
+        openssl \
+        wireguard-tools
+
+WORKDIR /e2e
+
+# Install dev deps first so subsequent source-only changes hit the
+# Docker layer cache rather than refetching @types/bun every build.
+COPY package.json ./
+RUN bun install --no-progress
+
+# Test source. All TypeScript lives under src/ — tests, helpers, and
+# the runner orchestrator. Configs stay at the project root.
+COPY tsconfig.json bunfig.toml ./
+COPY src ./src
+
+# Each phase is fully self-contained (own bootstrap, own users, own
+# cleanup), but several phases mutate shared global state (wg/stop,
+# wg/start, password rotation, settings flip), so the tester must
+# still run files serially. `bun test`'s default discovery order
+# isn't guaranteed alphabetical, so we shell-expand `ls | sort` and
+# pass file paths explicitly — `bun test` runs positional files in
+# argument order in a single process.
+#
+# The 60s per-test timeout covers the longest poller
+# (`waitUntil(15_000, …)` for the reconciler) plus slack for slow CI
+# hosts. The JUnit report is written to /results, which
+# docker-compose.yml mounts on the host so CI tooling can pick it
+# up.
+CMD ["sh", "-c", \
+     "bun test --timeout 60000 --reporter=junit --reporter-outfile=/results/junit.xml $(ls src/*.test.ts | sort)"]

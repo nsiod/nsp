@@ -13,10 +13,10 @@ actually carries traffic.
    │                                                    │
    │  ┌──────────────┐                ┌──────────────┐  │
    │  │   nsp-e2e    │  HTTP :8443    │ nsp-e2e-tester│ │
-   │  │ (kernel WG)  │◄───────────────│  curl + jq +  │ │
-   │  │  wg0 = 10.99.│                │  wg-tools     │ │
-   │  │  99.1/24     │  WG :51820/udp │  (wgtest0)    │ │
-   │  │              │◄═══════════════│  10.99.99.X   │ │
+   │  │ (kernel WG)  │◄───────────────│   bun test    │ │
+   │  │  wg0 = 10.99.│                │   + wg-tools  │ │
+   │  │  99.1/24     │  WG :51820/udp │   (wgtest0)   │ │
+   │  │              │◄═══════════════│   10.99.99.X  │ │
    │  └──────────────┘                └──────────────┘  │
    └────────────────────────────────────────────────────┘
 ```
@@ -25,7 +25,16 @@ Both containers carry `NET_ADMIN`; nothing is exposed to the host.
 
 ## Phases
 
-The 96 assertions in `run-e2e.sh` are organised into 12 phases:
+Each phase lives in its own `src/NN-name.test.ts` file. `bun test`
+discovers tests recursively from CWD and runs files in alphabetical
+order in a single process, so the `00-`–`12-` prefix locks the
+execution sequence. State (alice/bob ids, server pubkey, generated
+keypairs) is shared through `src/lib/ctx.ts` — a singleton module
+that survives across test files because Bun loads every test file
+into the same process.
+
+`bunfig.toml` sets `concurrent = false` so tests within each file
+also run serially.
 
 | Phase | Subject |
 |-------|---------|
@@ -43,39 +52,112 @@ The 96 assertions in `run-e2e.sh` are organised into 12 phases:
 | 11 | Cleanup — disable / cascade delete, reconciler converges peer count to 0 |
 | 12 | Error hygiene — unknown user 404, unauthenticated 401 |
 
-## Files
+## Layout
 
-| File                  | Role                                                  |
-|-----------------------|-------------------------------------------------------|
-| `docker-compose.yml`  | `nsp` + `tester` on `nsp-e2e-net` (10.231.99.0/24).   |
-| `Dockerfile.tester`   | alpine + curl + jq + wireguard-tools + iputils.       |
-| `run-e2e.sh`          | The test cases. Runs inside the tester.               |
-| `run.sh`              | Repo-root wrapper: build, run, tear down.             |
+```
+tests/e2e/
+  docker-compose.yml     nsp + tester on nsp-e2e-net (10.231.99.0/24)
+  Dockerfile.tester      oven/bun:1.3.12-alpine + wireguard-tools / iproute2
+  package.json           bun test + bun run e2e scripts, dev deps
+  tsconfig.json          strict + noUncheckedIndexedAccess
+  bunfig.toml            [test] concurrent = false (phases share state)
+  README.md
+  results/               JUnit reports (gitignored, recreated per run)
+    junit.xml
+  src/
+    runner.ts            Bun wrapper: build, compose up/down, report path
+    00-bootstrap.test.ts
+    01-wg-control.test.ts
+    02-settings.test.ts
+    03-users-wg.test.ts
+    04-subnet-conflict.test.ts
+    05-shadowsocks.test.ts
+    06-iptables.test.ts
+    07-wg-lifecycle.test.ts
+    08-data-plane.test.ts
+    09-metrics.test.ts
+    10-auth-rotation.test.ts
+    11-cleanup.test.ts
+    12-error-paths.test.ts
+    lib/
+      ctx.ts             Module singleton: env, Client, ctx, bootstrap()
+      client.ts          Typed HTTP wrapper (auth, JSON, status helpers)
+      wait.ts            waitUntil / waitForApi polling helpers
+      sh.ts              Bun.spawn wrapper + wg keygen + getent hosts
+      predicates.ts      wgRunningIs / wgTotalPeersIs / ssRunningIs
+      types.ts           DTO shapes the assertions read
+```
+
+Configs stay at the project root; everything code-shaped is under
+`src/`. Adding a new phase or scenario is `touch src/NN-name.test.ts`
+plus a new `describe` block — pick `NN` so it lands at the right spot
+in the alphabetical sequence.
 
 ## Running
 
-From the repo root:
+From `tests/e2e/`:
 
 ```bash
-tests/e2e/run.sh                 # build image + run suite
-NO_BUILD=1 tests/e2e/run.sh      # skip rebuild, reuse existing nsp:e2e
+bun install                      # one-time, picks up @types/bun + tsc
+bun run e2e                      # build image + run suite
+NO_BUILD=1 bun run e2e           # skip rebuild, reuse existing nsp:e2e
+```
+
+Or from the repo root:
+
+```bash
+bun run tests/e2e/src/runner.ts
 ```
 
 Requirements:
-- Docker ≥ 24 with compose v2.
+- Docker ≥ 24 with compose v2, on PATH.
+- Bun ≥ 1.3 on PATH.
 - The host's `wireguard` kernel module loaded (`sudo modprobe
   wireguard`). Both the server and the tester reach into the same
   module via netlink in their respective network namespaces.
 - The nsp container is granted `NET_ADMIN` (compose handles this);
   the tester is too — it brings up its own kernel WG interface in
-  Phase 8.
+  phase 8.
 
-The wrapper exits with the tester's exit code. On failure it dumps
-the last 200 lines of `nsp` logs.
+`runner.ts` exits with the tester's exit code. On failure it dumps
+the last 200 lines of `nsp` logs and tears the compose project down
+even on Ctrl-C / unhandled error.
+
+## Test reports
+
+Each run writes a JUnit XML report to `tests/e2e/results/junit.xml`
+(gitignored). The tester container produces it via
+`bun test --reporter=junit --reporter-outfile=/results/junit.xml`,
+and docker-compose bind-mounts `./results` over `/results` so the
+file is on the host when the tester exits. CI tools like GitHub
+Actions, GitLab, and Jenkins know how to render JUnit XML directly.
+
+Per-phase reporting falls out for free: every phase file has its own
+`describe` block, so the JUnit `<testsuite>` elements line up with
+phase boundaries.
+
+## Iterating on tests
+
+```bash
+# Build only the tester image.
+docker compose -f tests/e2e/docker-compose.yml -p nsp-e2e build tester
+
+# Run a single phase by file (alphabetical-prefix lookup).
+docker compose -f tests/e2e/docker-compose.yml -p nsp-e2e \
+    run --rm tester bun test src/08-data-plane.test.ts
+
+# Or by name pattern across files.
+docker compose -f tests/e2e/docker-compose.yml -p nsp-e2e \
+    run --rm tester bun test --test-name-pattern "phase 8"
+
+# Bail at the first failing assertion (useful for cascade triage).
+docker compose -f tests/e2e/docker-compose.yml -p nsp-e2e \
+    run --rm tester bun test --bail=1
+```
 
 ## Polling
 
 State transitions (`wg/start`, `wg/stop`, reconciler convergence,
-counter updates) are checked with `wait_until <secs> <label> <cmd>`
-rather than fixed `sleep` calls — failures point at the predicate
-that timed out so triage is straightforward.
+counter updates) are checked with `waitUntil(timeoutMs, predicate, {
+label })` rather than fixed `setTimeout` calls — failures point at the
+predicate that timed out so triage is straightforward.

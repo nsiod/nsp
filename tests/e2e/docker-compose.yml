@@ -1,9 +1,15 @@
 services:
   nsp:
-    # Built locally by tests/e2e/run.sh from the repo root Dockerfile.
+    # Built locally by `bun run e2e` from the repo root Dockerfile.
     image: nsp:e2e
     container_name: nsp-e2e
     hostname: nsp
+    # Tag every e2e-suite container with a stable label so teardown
+    # can sweep up by label rather than by name. Also covers any
+    # auxiliary containers compose might spawn in the future without
+    # explicit container_name entries.
+    labels:
+      nsp.e2e: "true"
     networks:
       e2e:
         aliases: [nsp]
@@ -52,6 +58,8 @@ services:
       dockerfile: Dockerfile.tester
     image: nsp-e2e-tester:latest
     container_name: nsp-e2e-tester
+    labels:
+      nsp.e2e: "true"
     networks:
       e2e:
     # NET_ADMIN: the data-plane phase brings up its own kernel WG
@@ -63,12 +71,18 @@ services:
       NSP_ADMIN_PASSWORD: ${NSP_ADMIN_PASSWORD:-changeme}
       NSP_METRICS_TOKEN: ${NSP_METRICS_TOKEN:-e2e-metrics-secret}
       NSP_SERVER_HOST: nsp
+    # The tester writes a JUnit report to /results inside the
+    # container; the bind mount surfaces it to the host so CI / the
+    # runner can read it. `runner.ts` clears this directory on each
+    # invocation.
+    volumes:
+      - ./results:/results
     depends_on:
       nsp:
         condition: service_healthy
-    # Re-exec the script when the compose project is brought up. The
-    # exit code of the tester is what `docker compose run` reports.
-    command: ["/usr/local/bin/run-e2e.sh"]
+    # Default command lives in Dockerfile.tester (CMD ["bun", "test",
+    # ..., "--reporter=junit", ...]). Override here only when
+    # debugging (e.g. `bun test --bail --test-name-pattern …`).
 
 networks:
   e2e:

@@ -23,9 +23,11 @@ use ipnetwork::Ipv4Network;
 use crate::error::Result;
 
 pub mod kernel;
+pub mod lazy;
 pub mod userspace;
 
 pub use kernel::KernelBackend;
+pub use lazy::{LazyContext, LazyPeerUdpFactory, LazyPeerUdpRecv, PeerResolver, NEGATIVE_TTL};
 pub use userspace::UserspaceBackend;
 
 /// Selector for which data-plane implementation to construct.
@@ -159,16 +161,42 @@ pub trait WgBackend: Send + Sync + std::fmt::Debug {
     /// Probe whether the backend can run on this host. Used by
     /// `/api/wg/status` and by `BackendKind::Auto` resolution.
     fn availability(&self) -> BackendAvailability;
+
+    /// Whether the driver should load every persisted peer into
+    /// [`BackendBringUp::initial_peers`] before calling `up`. Defaults
+    /// to `true` (kernel + eager userspace). The lazy userspace
+    /// backend returns `false` so spawn_real skips the up-front DB
+    /// scan and Vec construction; peers come in on demand instead.
+    fn eager_seed_peers(&self) -> bool {
+        true
+    }
 }
 
 /// Construct the right backend for `kind`. `Auto` falls back to
 /// userspace when the kernel probe fails. The returned [`ResolvedBackend`]
 /// records both the requested and the effective kind so callers can
 /// surface that distinction in logs / status views.
-pub fn build(kind: BackendKind) -> (Arc<dyn WgBackend>, ResolvedBackend) {
+///
+/// `resolver`:
+/// - `Some(_)` activates lazy peer mode for the userspace backend —
+///   peers are looked up on the fly via the resolver when their
+///   handshake init arrives. Ignored for the kernel backend, which
+///   always eager-loads every peer.
+/// - `None` keeps the legacy eager userspace behaviour. Useful in
+///   tests that don't care about persistence.
+pub fn build(
+    kind: BackendKind,
+    resolver: Option<Arc<dyn PeerResolver>>,
+) -> (Arc<dyn WgBackend>, ResolvedBackend) {
+    let make_userspace = || -> Arc<dyn WgBackend> {
+        match resolver.clone() {
+            Some(r) => Arc::new(UserspaceBackend::lazy(r)),
+            None => Arc::new(UserspaceBackend::new()),
+        }
+    };
     match kind {
         BackendKind::Userspace => (
-            Arc::new(UserspaceBackend::new()),
+            make_userspace(),
             ResolvedBackend {
                 requested: kind,
                 effective: BackendKind::Userspace,
@@ -193,7 +221,7 @@ pub fn build(kind: BackendKind) -> (Arc<dyn WgBackend>, ResolvedBackend) {
                 )
             } else {
                 (
-                    Arc::new(UserspaceBackend::new()),
+                    make_userspace(),
                     ResolvedBackend {
                         requested: kind,
                         effective: BackendKind::Userspace,

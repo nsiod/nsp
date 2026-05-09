@@ -74,8 +74,8 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
 pub use backend::{
-    BackendBringUp, BackendKind, BackendPeer, BackendPeerStats, KernelBackend, ResolvedBackend,
-    UserspaceBackend, WgBackend,
+    BackendBringUp, BackendKind, BackendPeer, BackendPeerStats, KernelBackend, PeerResolver,
+    ResolvedBackend, UserspaceBackend, WgBackend,
 };
 pub use error::{Result, WgError};
 pub use ipam::{Ipam, IpamError};
@@ -207,8 +207,17 @@ impl std::fmt::Debug for WgDriver {
 impl WgDriver {
     /// Build a driver handle. Does not touch the network or the DB; call
     /// [`WgDriver::spawn_real`] before issuing CRUD.
+    ///
+    /// The userspace backend is constructed in **lazy peer** mode: at
+    /// `spawn_real` time the gotatun device starts with no peers, and
+    /// inbound handshake inits trigger an indexed `wg_peers` lookup
+    /// to install the peer on the fly. This keeps memory bounded
+    /// even with hundreds of thousands of registered users — only the
+    /// actively-handshaking subset stays resident on the device.
     pub fn new(cfg: WgConfig, db: Pool, master_key: Arc<MasterKey>) -> Self {
-        let (backend, resolved) = backend::build(cfg.backend);
+        let resolver: Arc<dyn PeerResolver> =
+            Arc::new(DbPeerResolver::new(db.clone(), Arc::clone(&master_key)));
+        let (backend, resolved) = backend::build(cfg.backend, Some(resolver));
         Self::with_backend(cfg, db, master_key, backend, resolved)
     }
 
@@ -358,22 +367,29 @@ impl WgDriver {
         // if the device build fails we still have a consistent in-memory view.
         self.seed_ipam().await?;
 
-        let persisted_peers = {
+        // Lazy backends pull peers on demand; skip the up-front DB
+        // scan + Vec build entirely so the driver doesn't churn 100k+
+        // rows through memory on a 100k-user deployment.
+        let eager_seed = self.inner.backend.eager_seed_peers();
+        let initial_peers = if eager_seed {
             let repo = WgRepo::new(&self.inner.db);
-            repo.list().await?
+            let persisted = repo.list().await?;
+            let mut v = Vec::with_capacity(persisted.len());
+            for row in &persisted {
+                v.push(peer_row_to_backend(row, self.data_key())?);
+            }
+            v
+        } else {
+            Vec::new()
         };
-
-        let mut initial = Vec::with_capacity(persisted_peers.len());
-        for row in &persisted_peers {
-            initial.push(peer_row_to_backend(row, self.data_key())?);
-        }
+        let initial_count = initial_peers.len();
 
         let bringup = BackendBringUp {
             interface: self.inner.cfg.interface.clone(),
             listen_port: self.inner.cfg.listen_port,
             server_private_key: *private_key_bytes,
             subnet: *self.inner.subnet.read().await,
-            initial_peers: initial,
+            initial_peers,
         };
         self.inner.backend.up(bringup).await?;
 
@@ -388,7 +404,8 @@ impl WgDriver {
 
         tracing::info!(
             target: "nsp::wg",
-            peer_count = persisted_peers.len(),
+            seeded_peers = initial_count,
+            eager_seed,
             backend = %self.backend_kind().label(),
             "WireGuard device up"
         );
@@ -1179,6 +1196,36 @@ fn row_into_view(
     })
 }
 
+/// SQLite-backed [`PeerResolver`] that the userspace backend uses to
+/// fetch peers on demand. Holds an `Arc<MasterKey>` so the cached
+/// `DataKey` stays bound to the live key rotation, and a clone of the
+/// SQLite pool so resolves can run on the runtime without holding the
+/// driver handle.
+#[derive(Debug)]
+struct DbPeerResolver {
+    pool: Pool,
+    master_key: Arc<MasterKey>,
+}
+
+impl DbPeerResolver {
+    fn new(pool: Pool, master_key: Arc<MasterKey>) -> Self {
+        Self { pool, master_key }
+    }
+}
+
+#[async_trait]
+impl PeerResolver for DbPeerResolver {
+    async fn resolve(&self, public_key: [u8; 32]) -> Result<Option<BackendPeer>> {
+        let row = WgRepo::new(&self.pool)
+            .find_by_public_key(&public_key)
+            .await?;
+        match row {
+            Some(row) => Ok(Some(peer_row_to_backend(&row, self.master_key.data_key())?)),
+            None => Ok(None),
+        }
+    }
+}
+
 fn peer_row_to_backend(row: &WgPeerRow, key: DataKey) -> Result<BackendPeer> {
     let allowed_ip: Ipv4Addr = row
         .allowed_ip
@@ -1740,5 +1787,49 @@ mod tests {
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].rx_bytes, 4_000);
         assert_eq!(samples[0].tx_bytes, 5_000);
+    }
+
+    #[tokio::test]
+    async fn userspace_default_is_lazy_and_skips_eager_seed() {
+        let pool = pool().await;
+        let mk = master_key();
+        let driver = WgDriver::new(cfg(), pool, mk);
+        // The lazy userspace backend must opt out of eager peer
+        // seeding so spawn_real avoids the up-front DB scan.
+        assert!(!driver.inner.backend.eager_seed_peers());
+        assert_eq!(driver.backend_kind(), BackendKind::Userspace);
+    }
+
+    #[tokio::test]
+    async fn db_peer_resolver_round_trips_inserted_peer() {
+        let pool = pool().await;
+        let mk = master_key();
+        let driver = WgDriver::new(cfg(), pool.clone(), Arc::clone(&mk));
+        driver.prepare().await.unwrap();
+
+        // Persist a peer through the normal API; the row will land in
+        // wg_peers with an encrypted PSK if requested.
+        let caller_pub = [9u8; 32];
+        let (view, _) = driver
+            .add_peer(PeerCreate {
+                public_key: Some(caller_pub),
+                preshared: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let resolver = DbPeerResolver::new(pool.clone(), mk);
+        let hit = resolver.resolve(caller_pub).await.unwrap();
+        let peer = hit.expect("resolver must surface the persisted peer");
+        assert_eq!(peer.public_key, caller_pub);
+        assert_eq!(peer.allowed_ip, view.allowed_ip);
+        assert!(
+            peer.preshared_key.is_some(),
+            "PSK must round-trip via DataKey"
+        );
+
+        let miss = resolver.resolve([0xAB; 32]).await.unwrap();
+        assert!(miss.is_none(), "unknown pubkeys must yield None");
     }
 }

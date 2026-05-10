@@ -1,0 +1,74 @@
+# Overlay: reverse-API control center setup.
+#
+# Layered onto the base compose with `-f docker-compose.yml -f
+# docker-compose.control.yml`. Adds the mock control center
+# container and wires nsp's NSP_CONTROL_* env to point at it.
+#
+# Test-mode env vars come from the runner so a single repo can
+# host several control-mode runs back-to-back, each with a fresh
+# nsp boot and its own snapshot/policy assumptions:
+#
+#   NSP_CONTROL_CONFLICT_POLICY  -> keep | prune
+#   NSP_CONTROL_INTERVAL_SECS    -> default 2 in this overlay
+#   NSP_CONTROL_STATUS_INTERVAL_SECS
+#   E2E_CONTROL_MODE             -> tag the run for the tester to
+#                                   gate scenario subsets on
+#
+# The mock-control container starts with an empty scripted
+# snapshot — every test programs it via `/__test__/snapshot` for
+# its own scenario.
+
+services:
+  nsp:
+    environment:
+      NSP_CONTROL: "true"
+      NSP_CONTROL_URL: http://mock-control:9090
+      NSP_CONTROL_NODE_ID: node-e2e
+      NSP_CONTROL_TOKEN: ${MOCK_CONTROL_TOKEN:-e2e-control-secret}
+      NSP_CONTROL_INTERVAL_SECS: ${NSP_CONTROL_INTERVAL_SECS:-2}
+      NSP_CONTROL_STATUS_INTERVAL_SECS: ${NSP_CONTROL_STATUS_INTERVAL_SECS:-2}
+      NSP_CONTROL_CONFLICT_POLICY: ${NSP_CONTROL_CONFLICT_POLICY:-keep}
+    depends_on:
+      mock-control:
+        condition: service_healthy
+
+  mock-control:
+    build:
+      context: ./mock-control
+      dockerfile: Dockerfile
+    image: nsp-e2e-mock-control:latest
+    container_name: nsp-e2e-mock-control
+    hostname: mock-control
+    labels:
+      nsp.e2e: "true"
+    networks:
+      e2e:
+        aliases: [mock-control]
+    environment:
+      MOCK_CONTROL_TOKEN: ${MOCK_CONTROL_TOKEN:-e2e-control-secret}
+      PORT: "9090"
+    expose:
+      - "9090"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9090/__test__/health"]
+      interval: 1s
+      timeout: 2s
+      retries: 15
+      start_period: 1s
+
+  tester:
+    environment:
+      # Surface the tags the tester needs to drive the mock and
+      # gate per-mode scenarios. When these are unset the
+      # phase-13 file self-skips entirely (see test 0 below).
+      MOCK_CONTROL_BASE: http://mock-control:9090
+      MOCK_CONTROL_NODE_ID: node-e2e
+      MOCK_CONTROL_TOKEN: ${MOCK_CONTROL_TOKEN:-e2e-control-secret}
+      NSP_CONTROL_INTERVAL_SECS: ${NSP_CONTROL_INTERVAL_SECS:-2}
+      NSP_CONTROL_CONFLICT_POLICY: ${NSP_CONTROL_CONFLICT_POLICY:-keep}
+      E2E_CONTROL_MODE: ${E2E_CONTROL_MODE:-default}
+    depends_on:
+      nsp:
+        condition: service_healthy
+      mock-control:
+        condition: service_healthy

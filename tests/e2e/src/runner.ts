@@ -23,9 +23,80 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const E2E_DIR = resolve(HERE, "..");
 const REPO_ROOT = resolve(E2E_DIR, "../..");
 const COMPOSE_FILE = join(E2E_DIR, "docker-compose.yml");
+const COMPOSE_CONTROL_OVERLAY = join(E2E_DIR, "docker-compose.control.yml");
 const RESULTS_DIR = join(E2E_DIR, "results");
-const JUNIT_PATH = join(RESULTS_DIR, "junit.xml");
 const PROJECT = "nsp-e2e";
+
+/**
+ * One end-to-end run. Each iteration of the runner picks ONE entry
+ * from the configured matrix, brings up an isolated compose stack
+ * with the listed compose files + extra env, runs the tester, and
+ * tears down. The control modes get their own clean nsp boot so
+ * `NSP_CONTROL_*` settings (cadence, conflict_policy, …) actually
+ * take effect — they're consumed at process startup.
+ */
+interface E2eMode {
+  /** Display tag, also used as the JUnit suffix. */
+  tag: string;
+  /** Compose files to layer (in order). */
+  composeFiles: string[];
+  /** Extra env injected into compose + tester. */
+  env: Record<string, string>;
+}
+
+const MODES: Record<string, E2eMode> = {
+  // Default: phases 00-12, no control center, no mock.
+  default: {
+    tag: "default",
+    composeFiles: [COMPOSE_FILE],
+    env: {},
+  },
+  // Reverse-API control center, conflict_policy = keep (the
+  // operator-side default). Phase 13 runs against this stack.
+  "control-keep": {
+    tag: "control-keep",
+    composeFiles: [COMPOSE_FILE, COMPOSE_CONTROL_OVERLAY],
+    env: {
+      NSP_CONTROL_CONFLICT_POLICY: "keep",
+      NSP_CONTROL_INTERVAL_SECS: "2",
+      NSP_CONTROL_STATUS_INTERVAL_SECS: "2",
+      E2E_CONTROL_MODE: "control-keep",
+    },
+  },
+  // Reverse-API control center, conflict_policy = prune. Same
+  // scenarios but the policy-tagged subset asserts that local
+  // extras absent from the snapshot are deleted on full sync.
+  "control-prune": {
+    tag: "control-prune",
+    composeFiles: [COMPOSE_FILE, COMPOSE_CONTROL_OVERLAY],
+    env: {
+      NSP_CONTROL_CONFLICT_POLICY: "prune",
+      NSP_CONTROL_INTERVAL_SECS: "2",
+      NSP_CONTROL_STATUS_INTERVAL_SECS: "2",
+      E2E_CONTROL_MODE: "control-prune",
+    },
+  },
+};
+
+/** Resolve the requested mode string into one or more E2eMode entries. */
+function resolveModes(arg: string): E2eMode[] {
+  if (arg === "all") {
+    return ["default", "control-keep", "control-prune"].map((k) => MODES[k]!);
+  }
+  if (arg === "control") {
+    return ["control-keep", "control-prune"].map((k) => MODES[k]!);
+  }
+  const m = MODES[arg];
+  if (!m) {
+    const known = Object.keys(MODES).concat(["control", "all"]).sort();
+    throw new Error(`unknown E2E_MODE=${arg}; known: ${known.join(", ")}`);
+  }
+  return [m];
+}
+
+function junitPathFor(tag: string): string {
+  return join(RESULTS_DIR, `junit-${tag}.xml`);
+}
 // Stable label every e2e container carries (set in docker-compose.yml).
 // Teardown sweeps up by label so renames or new auxiliary services
 // don't fall through. Anonymous volumes attached to those containers
@@ -140,23 +211,22 @@ async function listByLabel(kind: "ps" | "volume" | "network"): Promise<string[]>
     .filter((s) => s.length > 0);
 }
 
-let teardownInFlight = false;
-async function teardown(): Promise<void> {
-  if (teardownInFlight) return;
-  teardownInFlight = true;
-
+async function teardown(composeFiles: string[] = [COMPOSE_FILE]): Promise<void> {
   header("tearing down compose project");
-  await run([
-    "docker",
-    "compose",
-    "-f",
-    COMPOSE_FILE,
-    "-p",
-    PROJECT,
-    "down",
-    "--remove-orphans",
-    "--volumes",
-  ]);
+  const composeArgs = composeFiles.flatMap((f) => ["-f", f]);
+  await run(
+    [
+      "docker",
+      "compose",
+      ...composeArgs,
+      "-p",
+      PROJECT,
+      "down",
+      "--remove-orphans",
+      "--volumes",
+    ],
+    { failOk: true },
+  );
 
   // Belt-and-braces sweep by label. Catches:
   // - Containers compose missed (renamed, partial-create, etc.).
@@ -175,11 +245,15 @@ async function teardown(): Promise<void> {
   }
 }
 
+// Active compose-file set used by the signal-handler teardown so it
+// removes containers from whichever mode is currently running.
+let activeComposeFiles: string[] = [COMPOSE_FILE];
+
 function installSignalHandlers(): void {
   const onSignal = (signal: string, exitCode: number) => {
     void (async () => {
       console.log(`\n==> received ${signal}; cleaning up`);
-      await teardown();
+      await teardown(activeComposeFiles);
       process.exit(exitCode);
     })();
   };
@@ -201,25 +275,28 @@ async function prepareResultsDir(): Promise<void> {
   await chmod(RESULTS_DIR, 0o777);
 }
 
-async function main(): Promise<number> {
-  installSignalHandlers();
-  await checkWireguardModule();
-  await buildImage();
-  await prepareResultsDir();
+/** Run a single mode end-to-end and stash its JUnit report. */
+async function runMode(
+  mode: E2eMode,
+  baseEnv: Record<string, string>,
+): Promise<number> {
+  header(`==[ mode: ${mode.tag} ]==`);
+  activeComposeFiles = mode.composeFiles;
+  // Always tear down before each mode so a prior run's anonymous
+  // volume (sealed sqlite DB) doesn't leak into this nsp boot.
+  await teardown(mode.composeFiles);
 
   const env: Record<string, string> = {
-    ...(process.env as Record<string, string>),
-    NSP_MASTER_KEY: process.env["NSP_MASTER_KEY"] ?? generateMasterKey(),
-    NSP_ADMIN_PASSWORD: process.env["NSP_ADMIN_PASSWORD"] ?? "changeme-e2e",
+    ...baseEnv,
+    ...mode.env,
   };
+  const composeArgs = mode.composeFiles.flatMap((f) => ["-f", f]);
 
-  header("bringing up nsp + tester on dedicated docker network");
   const up = await run(
     [
       "docker",
       "compose",
-      "-f",
-      COMPOSE_FILE,
+      ...composeArgs,
       "-p",
       PROJECT,
       "up",
@@ -232,32 +309,60 @@ async function main(): Promise<number> {
   );
 
   if (up.code !== 0) {
-    header("e2e FAILED — capturing last 200 lines of nsp logs");
+    header(`mode ${mode.tag} FAILED — capturing last 200 lines of nsp logs`);
     await run(
       [
         "docker",
         "compose",
-        "-f",
-        COMPOSE_FILE,
+        ...composeArgs,
         "-p",
         PROJECT,
         "logs",
         "nsp",
         "--tail=200",
       ],
-      { inherit: true, env },
+      { inherit: true, env, failOk: true },
     );
   }
 
-  await teardown();
-
-  if (await Bun.file(JUNIT_PATH).exists()) {
-    header(`JUnit report: ${JUNIT_PATH}`);
+  // Move the per-run junit.xml out of the way so the next mode's
+  // tester doesn't overwrite it.
+  const baseJunit = join(RESULTS_DIR, "junit.xml");
+  const taggedJunit = junitPathFor(mode.tag);
+  if (await Bun.file(baseJunit).exists()) {
+    await Bun.write(taggedJunit, await Bun.file(baseJunit).bytes());
+    await rm(baseJunit, { force: true });
+    header(`JUnit report (${mode.tag}): ${taggedJunit}`);
   } else {
-    console.warn(`WARNING: no JUnit report at ${JUNIT_PATH}`);
+    console.warn(`WARNING: mode ${mode.tag} produced no JUnit report`);
   }
 
+  await teardown(mode.composeFiles);
   return up.code;
+}
+
+async function main(): Promise<number> {
+  installSignalHandlers();
+  await checkWireguardModule();
+  await buildImage();
+  await prepareResultsDir();
+
+  const baseEnv: Record<string, string> = {
+    ...(process.env as Record<string, string>),
+    NSP_MASTER_KEY: process.env["NSP_MASTER_KEY"] ?? generateMasterKey(),
+    NSP_ADMIN_PASSWORD: process.env["NSP_ADMIN_PASSWORD"] ?? "changeme-e2e",
+  };
+
+  const requested = process.env["E2E_MODE"] ?? "default";
+  const modes = resolveModes(requested);
+  header(`requested modes: ${modes.map((m) => m.tag).join(", ")}`);
+
+  let exit = 0;
+  for (const mode of modes) {
+    const code = await runMode(mode, baseEnv);
+    if (code !== 0 && exit === 0) exit = code;
+  }
+  return exit;
 }
 
 try {
@@ -265,6 +370,6 @@ try {
   process.exit(code);
 } catch (err) {
   console.error(err instanceof Error ? err.message : String(err));
-  await teardown();
+  await teardown(activeComposeFiles);
   process.exit(1);
 }

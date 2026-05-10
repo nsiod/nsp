@@ -40,16 +40,14 @@ services:
       NSP_ALLOW_INSECURE_NO_MASTER_KEY: "false"
       NSP_DB: /work/data/proxy.db
       NSP_WORK_DIR: /work
-      # Reverse-API control center (phase 13). Always-on, but the
-      # mock returns an empty snapshot by default so other phases
-      # are not affected. The phase-13 test programs the mock's
-      # response and asserts nsp converges accordingly.
-      NSP_CONTROL: "true"
-      NSP_CONTROL_URL: http://mock-control:9090
-      NSP_CONTROL_NODE_ID: node-e2e
-      NSP_CONTROL_TOKEN: ${MOCK_CONTROL_TOKEN:-e2e-control-secret}
-      NSP_CONTROL_INTERVAL_SECS: "2"
-      NSP_CONTROL_STATUS_INTERVAL_SECS: "2"
+      # Reverse-API control center is intentionally NOT wired here.
+      # The control suite lives behind a separate compose overlay
+      # (docker-compose.control.yml) so:
+      #   1. Phases 00-12 don't have a background sync loop firing
+      #      every couple seconds + churning hashes.
+      #   2. Different control modes (conflict_policy, mode flags,
+      #      intervals) can each get a clean nsp boot via a fresh
+      #      run of the runner with a different mode arg.
       RUST_LOG: nsp=debug,nsp_wg_driver=debug,nsp_ss_driver=debug,nsp_api=debug,info
     expose:
       - "8443"
@@ -61,37 +59,6 @@ services:
       timeout: 2s
       retries: 30
       start_period: 2s
-    depends_on:
-      mock-control:
-        condition: service_healthy
-
-  # Mock control center for phase 13. Speaks the reverse-API
-  # protocol from `docs/control-center.md` plus a `/__test__/*`
-  # interface the tester drives. Defaults to an empty snapshot so
-  # always-on doesn't perturb the rest of the suite.
-  mock-control:
-    build:
-      context: ./mock-control
-      dockerfile: Dockerfile
-    image: nsp-e2e-mock-control:latest
-    container_name: nsp-e2e-mock-control
-    hostname: mock-control
-    labels:
-      nsp.e2e: "true"
-    networks:
-      e2e:
-        aliases: [mock-control]
-    environment:
-      MOCK_CONTROL_TOKEN: ${MOCK_CONTROL_TOKEN:-e2e-control-secret}
-      PORT: "9090"
-    expose:
-      - "9090"
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9090/__test__/health"]
-      interval: 1s
-      timeout: 2s
-      retries: 15
-      start_period: 1s
 
   tester:
     build:
@@ -112,14 +79,6 @@ services:
       NSP_ADMIN_PASSWORD: ${NSP_ADMIN_PASSWORD:-changeme}
       NSP_METRICS_TOKEN: ${NSP_METRICS_TOKEN:-e2e-metrics-secret}
       NSP_SERVER_HOST: nsp
-      # Reverse-API mock for phase 13. The mock listens on the
-      # `mock-control` hostname inside the e2e network; the tester
-      # uses these to drive scenarios via `/__test__/*`.
-      MOCK_CONTROL_BASE: http://mock-control:9090
-      MOCK_CONTROL_NODE_ID: node-e2e
-      # nsp's NSP_CONTROL_INTERVAL_SECS — tests use this to pick a
-      # safe wait budget for sync convergence.
-      NSP_CONTROL_INTERVAL_SECS: "2"
     # The tester writes a JUnit report to /results inside the
     # container; the bind mount surfaces it to the host so CI / the
     # runner can read it. `runner.ts` clears this directory on each

@@ -59,7 +59,7 @@ also run serially.
 | 10 | Auth rotation — change password bumps `token_generation`, old JWT now 401, new password works |
 | 11 | Cleanup — disable / cascade delete, reconciler converges peer count to 0 |
 | 12 | Error hygiene — unknown user 404, unauthenticated 401 |
-| 13 | **Reverse-API control center** — full-snapshot reconcile (users tagged `source=control`), local-API 403 on control-source mutations, delta delete, source-boundary id collision (asserts `/report` event), `/status` body shape (services + traffic + cursor), `/config` request hashes, iptables full snapshot install, `mode: replace` prune |
+| 13 | **Reverse-API control center** — *opt-in via `E2E_MODE=control*`*. Full-snapshot reconcile (users tagged `source=control`), local-API 403 on control-source mutations, delta delete, source-boundary id collision (asserts `/report` event), `/status` body shape (services + traffic + cursor), `/config` request hashes, iptables full-snapshot install, **policy-tagged**: `keep` keeps local extras / `prune` evicts them, server-driven `mode: replace` always prunes. Self-skips under the default runner. |
 
 ## Layout
 
@@ -112,15 +112,46 @@ From `tests/e2e/`:
 
 ```bash
 bun install                      # one-time, picks up @types/bun + tsc
-bun run e2e                      # build image + run suite
+
+# Default: phases 00-12 only. nsp boots without NSP_CONTROL,
+# without the mock-control container, without the overlay env.
+# Phase 13 self-skips.
+bun run e2e
+
+# Reverse-API control center suite. Brings up the control overlay
+# (mock-control + NSP_CONTROL_*), runs phase 13. Each control mode
+# is a SEPARATE compose run with its own clean nsp boot — that's
+# the only way NSP_CONTROL_CONFLICT_POLICY actually takes effect
+# (it's read at process startup).
+bun run e2e:control:keep         # policy=keep
+bun run e2e:control:prune        # policy=prune
+bun run e2e:control              # both, back-to-back
+
+# Default + both control modes:
+bun run e2e:all
+
 NO_BUILD=1 bun run e2e           # skip rebuild, reuse existing nsp:e2e
 ```
 
 Or from the repo root:
 
 ```bash
-bun run tests/e2e/src/runner.ts
+E2E_MODE=control bun run tests/e2e/src/runner.ts
 ```
+
+The runner reads `E2E_MODE` to pick a mode (`default` /
+`control-keep` / `control-prune` / `control` / `all`). Each mode
+has its own JUnit report at `results/junit-<mode>.xml`.
+
+### Adding a control mode
+
+A control mode is one entry in the `MODES` table at the top of
+`runner.ts`. Each entry is `{ tag, composeFiles, env }` —
+`composeFiles` lists the YAMLs to layer (the base + any overlays),
+and `env` is injected into both compose and the tester. Use it to
+add e.g. a `control-fast` mode with a sub-second tick, or a
+`control-readonly-api` mode that combines the control overlay
+with a `security.api = readonly` env override.
 
 Requirements:
 - Docker ≥ 24 with compose v2, on PATH.

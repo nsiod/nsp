@@ -37,6 +37,7 @@ export interface User {
   name: string;
   note: string | null;
   wg_enabled: boolean;
+  source?: "local" | "control" | string;
 }
 
 export interface WgPeerDto {

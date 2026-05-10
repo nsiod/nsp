@@ -9,19 +9,27 @@ actually carries traffic.
 
 ```
                            e2e bridge (10.231.99.0/24)
-   ┌────────────────────────────────────────────────────┐
-   │                                                    │
-   │  ┌──────────────┐                ┌──────────────┐  │
-   │  │   nsp-e2e    │  HTTP :8443    │ nsp-e2e-tester│ │
-   │  │ (kernel WG)  │◄───────────────│   bun test    │ │
-   │  │  wg0 = 10.99.│                │   + wg-tools  │ │
-   │  │  99.1/24     │  WG :51820/udp │   (wgtest0)   │ │
-   │  │              │◄═══════════════│   10.99.99.X  │ │
-   │  └──────────────┘                └──────────────┘  │
-   └────────────────────────────────────────────────────┘
+   ┌─────────────────────────────────────────────────────────┐
+   │  ┌──────────────┐                ┌──────────────────┐   │
+   │  │   nsp-e2e    │  HTTP :8443    │ nsp-e2e-tester   │   │
+   │  │ (kernel WG)  │◄───────────────│  bun test +      │   │
+   │  │  wg0 10.99/24│                │  wg-tools        │   │
+   │  │              │  WG :51820/udp │  (wgtest0)       │   │
+   │  │              │◄═══════════════│  10.99.99.X      │   │
+   │  └──────┬───────┘                └────────┬─────────┘   │
+   │         │ outbound                       │ inbound      │
+   │         │ POST /config /status           │ /__test__/*  │
+   │         │ /report                        ▼              │
+   │         │                       ┌──────────────────┐    │
+   │         └──────────────────────►│ nsp-e2e-mock-    │    │
+   │                                 │ control (Bun)    │    │
+   │                                 │ :9090            │    │
+   │                                 └──────────────────┘    │
+   └─────────────────────────────────────────────────────────┘
 ```
 
-Both containers carry `NET_ADMIN`; nothing is exposed to the host.
+All three containers carry `NET_ADMIN` (nsp + tester) and live on
+the same private bridge; nothing is exposed to the host.
 
 ## Phases
 
@@ -51,6 +59,7 @@ also run serially.
 | 10 | Auth rotation — change password bumps `token_generation`, old JWT now 401, new password works |
 | 11 | Cleanup — disable / cascade delete, reconciler converges peer count to 0 |
 | 12 | Error hygiene — unknown user 404, unauthenticated 401 |
+| 13 | **Reverse-API control center** — full-snapshot reconcile (users tagged `source=control`), local-API 403 on control-source mutations, delta delete, source-boundary id collision (asserts `/report` event), `/status` body shape (services + traffic + cursor), `/config` request hashes, iptables full snapshot install, `mode: replace` prune |
 
 ## Layout
 
@@ -79,6 +88,10 @@ tests/e2e/
     10-auth-rotation.test.ts
     11-cleanup.test.ts
     12-error-paths.test.ts
+    13-control-center.test.ts
+  mock-control/
+    Dockerfile           oven/bun:alpine — single Bun process
+    server.ts            Reverse-API mock + /__test__/* drive surface
     lib/
       ctx.ts             Module singleton: env, Client, ctx, bootstrap()
       client.ts          Typed HTTP wrapper (auth, JSON, status helpers)

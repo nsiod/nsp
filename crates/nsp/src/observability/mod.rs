@@ -153,6 +153,33 @@ fn describe_all() {
         Unit::Count,
         "Number of times configuration was (re)loaded from disk/env."
     );
+
+    // ---- control-center reverse-API metrics ----
+    describe_counter!(
+        METRIC_CONTROL_REQUESTS,
+        Unit::Count,
+        "Reverse-API requests by endpoint and outcome (ok / error)."
+    );
+    describe_counter!(
+        METRIC_CONTROL_USERS_RECONCILED,
+        Unit::Count,
+        "Users mutated by the control reconciler, labeled by action."
+    );
+    describe_counter!(
+        METRIC_CONTROL_IPTABLES_RECONCILED,
+        Unit::Count,
+        "Control-source iptables rules mutated by the reconciler, labeled by action."
+    );
+    describe_counter!(
+        METRIC_CONTROL_REPORT_EVENTS,
+        Unit::Count,
+        "Events shipped via POST /report, labeled by code."
+    );
+    describe_gauge!(
+        METRIC_CONTROL_LAST_SYNC_UNIX,
+        Unit::Seconds,
+        "Unix-second timestamp of the last successful /config request."
+    );
 }
 
 // ---- metric names ----
@@ -167,6 +194,13 @@ pub const METRIC_WG_LAST_HANDSHAKE_AGE: &str = "nsp_wg_last_handshake_age_second
 pub const METRIC_DB_POOL_IDLE: &str = "nsp_db_pool_idle";
 pub const METRIC_DB_POOL_SIZE: &str = "nsp_db_pool_size";
 pub const METRIC_CONFIG_RELOAD: &str = "nsp_config_reload_total";
+
+// ---- control-center reverse-API ----
+pub const METRIC_CONTROL_REQUESTS: &str = "nsp_control_requests_total";
+pub const METRIC_CONTROL_USERS_RECONCILED: &str = "nsp_control_users_reconciled_total";
+pub const METRIC_CONTROL_IPTABLES_RECONCILED: &str = "nsp_control_iptables_reconciled_total";
+pub const METRIC_CONTROL_REPORT_EVENTS: &str = "nsp_control_report_events_total";
+pub const METRIC_CONTROL_LAST_SYNC_UNIX: &str = "nsp_control_last_sync_unix_seconds";
 
 /// Emit a `nsp_config_reload_total{source="…"}` tick. Callers: the initial
 /// config load in `main.rs` and any future reload plumbing (SIGHUP, API).

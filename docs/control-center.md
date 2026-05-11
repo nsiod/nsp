@@ -651,6 +651,31 @@ everything else as-is, and waits for the next tick.
   database column names — `users.note`, for instance, is part of
   the protocol and stable across schema migrations.
 
+## Development with self-signed certs
+
+The bundled e2e mock-control container speaks plain HTTP for
+simplicity (it lives on a private docker bridge with nothing
+else on it). A production control center MUST serve HTTPS — the
+node uses rustls + `ring` + `webpki-roots` for outbound TLS and
+will refuse a connection whose chain doesn't validate against
+those roots.
+
+During local development against a self-signed control center
+the cleanest path is:
+
+1. Use a real cert (e.g. `mkcert` produces a locally-trusted
+   ACME-like cert), or
+2. Add your private CA to the host's system trust store before
+   nsp starts — `webpki-roots` ignores the system store, but
+   the alternative is to switch the build to
+   `rustls-tls-native-roots` (out of scope for this protocol
+   doc; tracked separately).
+
+There is no `--insecure-skip-verify` knob and there won't be —
+the control plane is a high-trust integration and bypassing
+verification undermines the security boundary the source-tagging
+design relies on.
+
 ## Security notes
 
 * `NSP_CONTROL_TOKEN` is sent in the `Authorization: Bearer` header
@@ -693,6 +718,36 @@ concern stays clearly on the node side.
 | `control.timeout_secs`   | `NSP_CONTROL_TIMEOUT_SECS`     | `10`    | Per-request timeout |
 | `control.conflict_policy`| `NSP_CONTROL_CONFLICT_POLICY`  | `keep`  | `keep` \| `prune` — operator's stance on local extras (uniform across users + iptables) |
 | `security.api`           | `NSP_API`                      | `enabled` | `enabled` \| `readonly` \| `disabled` — `/api/*` lockdown stance (purely node-local; see `docs/api-lockdown.md`) |
+
+## Audit log
+
+Every mutation the control reconciler applies emits an
+`audit_log` row tagged with `actor = "control"`. Operators can
+filter `/api/audit` (or `SELECT * FROM audit_log WHERE actor =
+'control'`) to see exactly what the remote control plane changed
+on this node.
+
+Emitted actions:
+
+| Action                       | Target          | Detail |
+|------------------------------|-----------------|--------|
+| `control.user.create`        | user id         | `name=…` |
+| `control.user.update`        | user id         | `name=…` |
+| `control.user.delete`        | user id         | `delta delete` or `prune (full snapshot)` |
+| `control.iptables.add`       | (none)          | `<table> <chain> <spec>` |
+| `control.iptables.remove`    | iptables rule id | `<table> <chain> <spec>` |
+| `control.settings.patch`     | (none)          | `fields=[domain,wg_subnet,…]` (only changed fields) |
+
+The actor string is constant (`control`) — control-center
+operators don't get per-user attribution because the reverse-API
+protocol doesn't carry an end-user identity. If you need
+per-operator attribution, capture it server-side and surface it
+through the snapshot's `detail` field convention (TBD).
+
+Audit emission is best-effort: a failed audit insert is logged at
+`debug` level and the reconcile continues. The control plane
+will never fail to apply a directive just because the audit
+table couldn't be written.
 
 ## Local persistence
 

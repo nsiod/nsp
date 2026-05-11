@@ -91,8 +91,8 @@ use nsp_core::{
     ReconcilerHandle,
 };
 use nsp_db::{
-    Pool, ServerConfigRepo, SettingsPatch, SettingsRepo, SettingsRow, UserRow, UserSource,
-    UsersRepo,
+    AuditRepo, Pool, ServerConfigRepo, SettingsPatch, SettingsRepo, SettingsRow, UserRow,
+    UserSource, UsersRepo,
 };
 use nsp_netctl::{IptablesManager, ListFilter, RegisterOptions, RuleSpec, Source, StoredRule};
 use nsp_ss_driver::SsDriver;
@@ -107,6 +107,37 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// `server_config` key under which the control-center cursor is stored.
 const CURSOR_KEY: &str = "control_cursor";
+
+/// Audit `actor` for every row the control reconciler touches.
+/// Keeps the audit-log entries distinguishable from `/api/*` admin
+/// activity (which logs the JWT subject) so operators can answer
+/// "did the control center change this, or did I?" at a glance.
+const AUDIT_ACTOR: &str = "control";
+
+/// Best-effort audit-log emission. Failures are logged at `debug`
+/// and swallowed — never fail a reconcile because the audit table
+/// couldn't be written.
+async fn audit(pool: &Pool, action: &str, target: Option<&str>, detail: Option<&str>) {
+    if let Err(err) = AuditRepo::new(pool)
+        .append(AUDIT_ACTOR, action, target, detail)
+        .await
+    {
+        tracing::debug!(%err, action, "control: audit append failed");
+    }
+}
+
+/// Floor for the `/config` and `/status` poll intervals. A
+/// sub-second cadence would hammer the control center; this
+/// guards against accidental zero / one-second misconfigurations.
+/// Operators wanting genuine fast turnaround should set their env
+/// to `MIN_INTERVAL_SECS` or above and accept the floor as the
+/// effective minimum.
+const MIN_INTERVAL_SECS: u64 = 5;
+
+#[must_use]
+fn clamp_interval_secs(secs: u64) -> u64 {
+    secs.max(MIN_INTERVAL_SECS)
+}
 
 // ----------------------------------------------------------------------
 // Issue / status reporting
@@ -925,8 +956,8 @@ pub fn spawn(
             return None;
         }
     };
-    let config_interval = Duration::from_secs(cfg.interval_secs.max(5));
-    let status_interval = Duration::from_secs(cfg.status_interval_secs.max(5));
+    let config_interval = Duration::from_secs(clamp_interval_secs(cfg.interval_secs));
+    let status_interval = Duration::from_secs(clamp_interval_secs(cfg.status_interval_secs));
     tracing::info!(
         url = client.base_url.as_str(),
         node_id = client.node_id.as_str(),
@@ -1029,9 +1060,30 @@ async fn run_report_loop(
         let cursor = read_cursor(pool).await.ok().flatten();
         match client.post_report(cursor.as_deref(), &events).await {
             Ok(()) => {
+                metrics::counter!(
+                    crate::observability::METRIC_CONTROL_REQUESTS,
+                    "endpoint" => "report",
+                    "outcome" => "ok",
+                )
+                .increment(1);
+                // Per-event counter so the control center sees the
+                // distribution of codes the node is reporting.
+                for ev in &events {
+                    metrics::counter!(
+                        crate::observability::METRIC_CONTROL_REPORT_EVENTS,
+                        "code" => ev.code,
+                    )
+                    .increment(1);
+                }
                 tracing::debug!(count = events.len(), "control: report posted",);
             }
             Err(err) => {
+                metrics::counter!(
+                    crate::observability::METRIC_CONTROL_REQUESTS,
+                    "endpoint" => "report",
+                    "outcome" => "error",
+                )
+                .increment(1);
                 // Events are point-in-time; we drop them rather than
                 // re-queue forever. The reconcile path will re-emit
                 // server-side conflicts on the next /config tick if
@@ -1070,8 +1122,28 @@ async fn run_config_once(
     let state = collect_state(pool, iptables).await;
 
     let snap = match client.post_config(cursor.as_deref(), &state).await {
-        Ok(s) => s,
+        Ok(s) => {
+            metrics::counter!(
+                crate::observability::METRIC_CONTROL_REQUESTS,
+                "endpoint" => "config",
+                "outcome" => "ok",
+            )
+            .increment(1);
+            if let Ok(epoch) = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+            {
+                metrics::gauge!(crate::observability::METRIC_CONTROL_LAST_SYNC_UNIX)
+                    .set(epoch.as_secs() as f64);
+            }
+            s
+        }
         Err(err) => {
+            metrics::counter!(
+                crate::observability::METRIC_CONTROL_REQUESTS,
+                "endpoint" => "config",
+                "outcome" => "error",
+            )
+            .increment(1);
             tracing::warn!(%err, "control: POST /config failed");
             return;
         }
@@ -1179,6 +1251,12 @@ async fn run_status_once(
         .await
     {
         Ok(()) => {
+            metrics::counter!(
+                crate::observability::METRIC_CONTROL_REQUESTS,
+                "endpoint" => "status",
+                "outcome" => "ok",
+            )
+            .increment(1);
             tracing::debug!(
                 wg_peers = report.traffic.wg.peers.len(),
                 live_issues = issues.len(),
@@ -1186,6 +1264,12 @@ async fn run_status_once(
             );
         }
         Err(err) => {
+            metrics::counter!(
+                crate::observability::METRIC_CONTROL_REQUESTS,
+                "endpoint" => "status",
+                "outcome" => "error",
+            )
+            .increment(1);
             tracing::warn!(%err, "control: POST /status failed");
             // Live issues are recomputed every tick from observable
             // state, so the next status will surface the same
@@ -1267,7 +1351,7 @@ pub async fn reconcile_outcome(
 
     if let Some(rules) = snapshot.iptables.as_ref() {
         match iptables {
-            Some(mgr) => apply_iptables(mgr, rules, prune, &mut outcome.stats).await?,
+            Some(mgr) => apply_iptables(pool, mgr, rules, prune, &mut outcome.stats).await?,
             None => {
                 tracing::warn!(
                     rules = rules.len(),
@@ -1301,7 +1385,7 @@ async fn apply_full_users(
     let users_repo = UsersRepo::new(pool);
     for incoming in list {
         validate_user(incoming)?;
-        upsert_user(&users_repo, incoming, outcome).await?;
+        upsert_user(pool, &users_repo, incoming, outcome).await?;
     }
     if prune {
         let snapshot_ids: std::collections::HashSet<&str> =
@@ -1314,6 +1398,7 @@ async fn apply_full_users(
         for row in control_rows {
             if !snapshot_ids.contains(row.id.as_str()) && users_repo.delete(&row.id).await? {
                 outcome.stats.users_deleted += 1;
+                audit(pool, "control.user.delete", Some(&row.id), Some("prune (full snapshot)")).await;
             }
         }
     }
@@ -1331,6 +1416,7 @@ async fn apply_full_users(
 /// comment)` as the content key, so cosmetic ordering changes from
 /// the control center don't churn the kernel.
 async fn apply_iptables(
+    pool: &Pool,
     mgr: &dyn IptablesManager,
     desired: &[SnapshotRule],
     prune: bool,
@@ -1375,6 +1461,13 @@ async fn apply_iptables(
                 .await
                 .map_err(|e| anyhow!("control: remove iptables rule {}: {e}", row.id))?;
             removed += 1;
+            audit(
+                pool,
+                "control.iptables.remove",
+                Some(&row.id),
+                Some(&format!("{} {} {}", row.table, row.chain, row.spec)),
+            )
+            .await;
         }
         stats.iptables_removed = removed;
     }
@@ -1383,6 +1476,17 @@ async fn apply_iptables(
     if !wanted.is_empty() {
         let specs: Vec<RuleSpec> = wanted.into_iter().map(RuleKey::into_spec).collect();
         let added = specs.len();
+        // Audit BEFORE the kernel install so a partial failure
+        // still records that the control center asked for it.
+        for spec in &specs {
+            audit(
+                pool,
+                "control.iptables.add",
+                None,
+                Some(&format!("{} {} {}", spec.table, spec.chain, spec.spec)),
+            )
+            .await;
+        }
         mgr.register(Source::Control, specs, RegisterOptions { force: true })
             .await
             .map_err(|e| anyhow!("control: register iptables rules: {e}"))?;
@@ -1462,7 +1566,7 @@ async fn apply_user_delta(
     let users_repo = UsersRepo::new(pool);
     for incoming in &delta.upsert {
         validate_user(incoming)?;
-        upsert_user(&users_repo, incoming, outcome).await?;
+        upsert_user(pool, &users_repo, incoming, outcome).await?;
     }
     for id in &delta.delete {
         if id.trim().is_empty() {
@@ -1489,6 +1593,7 @@ async fn apply_user_delta(
             Some(_) => {
                 if users_repo.delete(id).await? {
                     outcome.stats.users_deleted += 1;
+                    audit(pool, "control.user.delete", Some(id), Some("delta delete")).await;
                 }
             }
         }
@@ -1510,6 +1615,7 @@ fn validate_user(incoming: &SnapshotUser) -> Result<()> {
 }
 
 async fn upsert_user(
+    pool: &Pool,
     users_repo: &UsersRepo<'_>,
     incoming: &SnapshotUser,
     outcome: &mut ReconcileOutcome,
@@ -1528,6 +1634,13 @@ async fn upsert_user(
                 .await
                 .with_context(|| format!("create user {}", incoming.id))?;
             outcome.stats.users_created += 1;
+            audit(
+                pool,
+                "control.user.create",
+                Some(&incoming.id),
+                Some(&format!("name={}", incoming.name)),
+            )
+            .await;
         }
         Some(existing) if existing.source == UserSource::Local => {
             // ID collision against a locally-owned row. Refusing to
@@ -1559,6 +1672,13 @@ async fn upsert_user(
             }
             if changed {
                 outcome.stats.users_updated += 1;
+                audit(
+                    pool,
+                    "control.user.update",
+                    Some(&incoming.id),
+                    Some(&format!("name={}", incoming.name)),
+                )
+                .await;
             }
         }
     }
@@ -1629,7 +1749,29 @@ async fn apply_settings(pool: &Pool, snap: &SnapshotSettings) -> Result<bool> {
     if patch.is_empty() {
         return Ok(false);
     }
+    // Capture which fields changed for the audit detail before
+    // patch consumes the values.
+    let mut changed_fields: Vec<&'static str> = Vec::new();
+    if patch.domain.is_some() {
+        changed_fields.push("domain");
+    }
+    if patch.wg_subnet.is_some() {
+        changed_fields.push("wg_subnet");
+    }
+    if patch.ss_listen_port.is_some() {
+        changed_fields.push("ss_listen_port");
+    }
+    if patch.wg_listen_port.is_some() {
+        changed_fields.push("wg_listen_port");
+    }
     repo.patch(patch).await?;
+    audit(
+        pool,
+        "control.settings.patch",
+        None,
+        Some(&format!("fields=[{}]", changed_fields.join(","))),
+    )
+    .await;
     Ok(true)
 }
 
@@ -2170,6 +2312,67 @@ mod tests {
             .unwrap()
             .expect("row");
         assert_eq!(row.source, UserSource::Control);
+    }
+
+    #[tokio::test]
+    async fn reconcile_emits_audit_entries_for_control_mutations() {
+        // Asserts: control-driven creates/updates/deletes show up
+        // in `audit_log` tagged with the "control" actor, so
+        // operators can answer "did the control center change this
+        // user, or did I?" from the same log everyone reads.
+        let pool = test_pool().await;
+        let audit = AuditRepo::new(&pool);
+
+        // 1. create
+        reconcile(
+            &pool,
+            &full_snapshot(vec![user("ctl-a", "alice", None)]),
+            ConflictPolicy::Keep,
+            None,
+        )
+        .await
+        .expect("reconcile create");
+
+        // 2. update (rename)
+        reconcile(
+            &pool,
+            &full_snapshot(vec![user("ctl-a", "alice-2", Some("note"))]),
+            ConflictPolicy::Keep,
+            None,
+        )
+        .await
+        .expect("reconcile update");
+
+        // 3. delete via delta
+        reconcile(
+            &pool,
+            &delta_snapshot(vec![], vec!["ctl-a".into()]),
+            ConflictPolicy::Keep,
+            None,
+        )
+        .await
+        .expect("reconcile delete");
+
+        let entries = audit.list(50).await.expect("audit list");
+        let actions: Vec<&str> = entries.iter().map(|e| e.action.as_str()).collect();
+        assert!(
+            actions.contains(&"control.user.create"),
+            "create entry missing; got {actions:?}"
+        );
+        assert!(
+            actions.contains(&"control.user.update"),
+            "update entry missing; got {actions:?}"
+        );
+        assert!(
+            actions.contains(&"control.user.delete"),
+            "delete entry missing; got {actions:?}"
+        );
+        // Every entry from the reconciler must be tagged as the
+        // control actor — easier on log filters than picking
+        // through detail blobs.
+        for e in &entries {
+            assert_eq!(e.actor, "control", "non-control actor in entry: {e:?}");
+        }
     }
 
     // ---------------- report() event channel ----------------
@@ -3162,6 +3365,48 @@ mod tests {
         assert_eq!(report.services.wg_peers_count, 0);
         assert!(report.services.wg_backend.is_none());
         assert!(report.traffic.wg.peers.is_empty());
+    }
+
+    // ---------------- misc safety ----------------
+
+    #[test]
+    fn interval_floor_clamps_sub_minimum_values() {
+        assert_eq!(clamp_interval_secs(0), MIN_INTERVAL_SECS);
+        assert_eq!(clamp_interval_secs(1), MIN_INTERVAL_SECS);
+        assert_eq!(clamp_interval_secs(MIN_INTERVAL_SECS - 1), MIN_INTERVAL_SECS);
+        assert_eq!(clamp_interval_secs(MIN_INTERVAL_SECS), MIN_INTERVAL_SECS);
+        assert_eq!(clamp_interval_secs(MIN_INTERVAL_SECS + 1), MIN_INTERVAL_SECS + 1);
+        assert_eq!(clamp_interval_secs(3600), 3600);
+    }
+
+    #[tokio::test]
+    async fn replace_mode_combined_with_prune_policy_is_idempotent_prune() {
+        // Both layers say "prune"; the outcome must still be a
+        // single prune (no double-deletes, no errors). The local
+        // user is still off-limits because the source-boundary is
+        // structural and unaffected by the policy/mode knobs.
+        let pool = test_pool().await;
+        UsersRepo::new(&pool)
+            .create("admin-1", "admin-alice", None)
+            .await
+            .expect("seed local");
+        seed_control_user(&pool, "ctl-1", "ctl-bob", None).await;
+        seed_control_user(&pool, "ctl-2", "ctl-carol", None).await;
+
+        let snap = Snapshot {
+            mode: SnapshotMode::Replace,
+            users: Some(UsersSection::Full(vec![user("ctl-1", "ctl-bob", None)])),
+            ..Snapshot::default()
+        };
+        let stats = reconcile(&pool, &snap, ConflictPolicy::Prune, None)
+            .await
+            .expect("reconcile");
+        assert_eq!(stats.users_deleted, 1, "only ctl-2 evicted, not the local row");
+
+        let repo = UsersRepo::new(&pool);
+        assert!(repo.get("admin-1").await.unwrap().is_some());
+        assert!(repo.get("ctl-1").await.unwrap().is_some());
+        assert!(repo.get("ctl-2").await.unwrap().is_none());
     }
 
     #[test]

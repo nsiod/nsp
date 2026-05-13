@@ -47,7 +47,9 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/:id/wg/rotate", post(rotate_wg))
         .route(
             "/:id/proxy",
-            get(get_proxy_detail).post(enable_proxy).delete(disable_proxy),
+            get(get_proxy_detail)
+                .post(enable_proxy)
+                .delete(disable_proxy),
         )
         .route("/:id/proxy/rotate", post(rotate_proxy))
 }

@@ -17,6 +17,7 @@ nsp-core = { path = "../core" }
 nsp-db = { path = "../db" }
 nsp-api = { path = "../api" }
 nsp-netctl = { path = "../netctl" }
+nsp-proxy-driver = { path = "../proxy-driver" }
 nsp-ss-driver = { path = "../ss-driver" }
 nsp-wg-driver = { path = "../wg-driver" }
 

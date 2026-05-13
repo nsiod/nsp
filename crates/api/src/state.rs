@@ -6,6 +6,7 @@ use nsp_core::crypto::{JwtKey, MasterKey};
 use nsp_core::ReconcilerHandle;
 use nsp_db::Pool;
 use nsp_netctl::IptablesManager;
+use nsp_proxy_driver::ProxyDriver;
 use nsp_ss_driver::SsDriver;
 use nsp_wg_driver::WgDriver;
 
@@ -21,6 +22,9 @@ pub struct AppState {
     pub ss_driver: Option<SsDriver>,
     /// Optional WireGuard driver. `None` when WG is disabled by config.
     pub wg: Option<WgDriver>,
+    /// Optional SOCKS5 + HTTP CONNECT proxy driver. `None` when the
+    /// proxy is disabled by config.
+    pub proxy: Option<ProxyDriver>,
     /// Unified iptables manager. `None` when the host lacks the `iptables`
     /// binary or the necessary capabilities; the `/api/iptables/*` routes
     /// return 503 in that case.
@@ -47,6 +51,7 @@ impl AppState {
             version,
             ss_driver: None,
             wg: None,
+            proxy: None,
             iptables: None,
             reconciler: None,
         }
@@ -59,6 +64,11 @@ impl AppState {
 
     pub fn with_wg(mut self, wg: WgDriver) -> Self {
         self.wg = Some(wg);
+        self
+    }
+
+    pub fn with_proxy(mut self, proxy: ProxyDriver) -> Self {
+        self.proxy = Some(proxy);
         self
     }
 

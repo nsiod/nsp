@@ -6,6 +6,7 @@ use axum::Router;
 use axum_server::Handle;
 use nsp_core::driver::Driver;
 use nsp_db::Pool;
+use nsp_proxy_driver::ProxyDriver;
 use nsp_ss_driver::SsDriver;
 use nsp_wg_driver::WgDriver;
 use tokio::signal;
@@ -19,6 +20,7 @@ pub async fn serve(
     pool: Pool,
     ss: Option<SsDriver>,
     wg: Option<WgDriver>,
+    proxy: Option<ProxyDriver>,
 ) -> anyhow::Result<()> {
     let handle = Handle::new();
 
@@ -45,6 +47,11 @@ pub async fn serve(
     if let Some(wg) = wg {
         if let Err(err) = wg.shutdown().await {
             tracing::warn!(?err, "wg shutdown");
+        }
+    }
+    if let Some(p) = proxy {
+        if let Err(err) = p.shutdown().await {
+            tracing::warn!(?err, "proxy shutdown");
         }
     }
 

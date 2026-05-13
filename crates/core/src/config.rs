@@ -32,6 +32,9 @@ pub struct ProxyConfig {
     /// WireGuard data plane (stub in M1).
     #[serde(default)]
     pub wireguard: WireguardConfig,
+    /// SOCKS5 + HTTP CONNECT proxy data plane.
+    #[serde(default)]
+    pub proxy: ProxyServerConfig,
     /// Structured logging.
     #[serde(default)]
     pub logging: LoggingConfig,
@@ -157,6 +160,36 @@ impl Default for ShadowsocksConfig {
 }
 
 fn default_ss_apply_debounce_ms() -> u64 {
+    500
+}
+
+/// SOCKS5 + HTTP CONNECT proxy. Disabled by default — exposing a proxy
+/// on a public interface is a high-blast-radius decision and the
+/// operator must opt in explicitly.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ProxyServerConfig {
+    pub enabled: bool,
+    pub bind: IpAddr,
+    pub socks5_port: u16,
+    pub http_port: u16,
+    /// Debounce window (ms) for coalescing apply bursts.
+    #[serde(default = "default_proxy_apply_debounce_ms")]
+    pub apply_debounce_ms: u64,
+}
+
+impl Default for ProxyServerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: IpAddr::from([0, 0, 0, 0]),
+            socks5_port: 1080,
+            http_port: 8080,
+            apply_debounce_ms: default_proxy_apply_debounce_ms(),
+        }
+    }
+}
+
+fn default_proxy_apply_debounce_ms() -> u64 {
     500
 }
 

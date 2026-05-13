@@ -134,6 +134,26 @@ pub struct ServeArgs {
     #[arg(long, env = "NSP_SS_DEBOUNCE_MS")]
     pub shadowsocks_apply_debounce_ms: Option<u64>,
 
+    /// Override `proxy.enabled`.
+    #[arg(long, env = "NSP_PROXY")]
+    pub proxy_enabled: Option<bool>,
+
+    /// Override `proxy.bind`.
+    #[arg(long, env = "NSP_PROXY_BIND")]
+    pub proxy_bind: Option<IpAddr>,
+
+    /// Override `proxy.socks5_port`.
+    #[arg(long, env = "NSP_PROXY_SOCKS5_PORT")]
+    pub proxy_socks5_port: Option<u16>,
+
+    /// Override `proxy.http_port`.
+    #[arg(long, env = "NSP_PROXY_HTTP_PORT")]
+    pub proxy_http_port: Option<u16>,
+
+    /// Override `proxy.apply_debounce_ms`.
+    #[arg(long, env = "NSP_PROXY_DEBOUNCE_MS")]
+    pub proxy_apply_debounce_ms: Option<u64>,
+
     /// Override `logging.level`.
     #[arg(long, env = "NSP_LOG")]
     pub logging_level: Option<String>,
@@ -253,6 +273,21 @@ pub fn load_config(args: &ServeArgs) -> anyhow::Result<ProxyConfig> {
     }
     if let Some(ms) = args.shadowsocks_apply_debounce_ms {
         cfg.shadowsocks.apply_debounce_ms = ms;
+    }
+    if let Some(enabled) = args.proxy_enabled {
+        cfg.proxy.enabled = enabled;
+    }
+    if let Some(bind) = args.proxy_bind {
+        cfg.proxy.bind = bind;
+    }
+    if let Some(port) = args.proxy_socks5_port {
+        cfg.proxy.socks5_port = port;
+    }
+    if let Some(port) = args.proxy_http_port {
+        cfg.proxy.http_port = port;
+    }
+    if let Some(ms) = args.proxy_apply_debounce_ms {
+        cfg.proxy.apply_debounce_ms = ms;
     }
     if let Some(ref level) = args.logging_level {
         cfg.logging.level.clone_from(level);

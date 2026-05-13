@@ -8,7 +8,7 @@
 /data/
 
 # UI build artifacts
-/ui/node_modules
+node_modules/
 /ui/dist/
 
 # IDE / OS

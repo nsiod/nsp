@@ -16,8 +16,8 @@ pub mod settings;
 
 pub use iptables::{IptablesRepo, IptablesRuleInsert, IptablesRuleRow};
 pub use repo::{
-    AuditLogRow, AuditRepo, ServerConfigRepo, SsRepo, SsUserRow, UserRow, UsersRepo, WgPeerInsert,
-    WgPeerRow, WgRepo,
+    AuditLogRow, AuditRepo, ProxyCredentialRow, ProxyRepo, ServerConfigRepo, SsRepo, SsUserRow,
+    UserRow, UsersRepo, WgPeerInsert, WgPeerRow, WgRepo,
 };
 pub use settings::{SettingsPatch, SettingsRepo, SettingsRow};
 

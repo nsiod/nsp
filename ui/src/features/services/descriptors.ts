@@ -1,7 +1,10 @@
 import type { UseMutationResult } from '@tanstack/react-query';
 import type { ApiError } from '@/shared/lib/http';
-import type { SsStatus, WgStatus } from '@/shared/types';
+import type { ProxyStatus, SsStatus, WgStatus } from '@/shared/types';
 import {
+  useProxyStartMutation,
+  useProxyStatusQuery,
+  useProxyStopMutation,
   useSsStartMutation,
   useSsStatusQuery,
   useSsStopMutation,
@@ -30,7 +33,7 @@ export interface ServiceStatusQuery {
 }
 
 export interface ServiceDescriptor {
-  id: 'shadowsocks' | 'wireguard';
+  id: 'shadowsocks' | 'wireguard' | 'proxy';
   name: string;
   description: string;
   useStatusQuery: () => ServiceStatusQuery;
@@ -90,6 +93,26 @@ function wgStatusToCommon(s: WgStatus): ServiceStatusCommon {
   };
 }
 
+function proxyStatusToCommon(s: ProxyStatus): ServiceStatusCommon {
+  return {
+    running: s.running,
+    available: s.available,
+    reason: s.reason,
+    subtitle: joinSubtitle([
+      s.public_host && s.socks5_port ? `socks5 ${s.public_host}:${s.socks5_port}` : '',
+      s.public_host && s.http_port ? `http ${s.public_host}:${s.http_port}` : '',
+    ]),
+    metrics: s.running
+      ? [
+          { label: 'Users', value: String(s.users) },
+          { label: 'SOCKS5 port', value: String(s.socks5_port) },
+          { label: 'HTTP port', value: String(s.http_port) },
+          { label: 'Reloads', value: String(s.reload_count) },
+        ]
+      : [],
+  };
+}
+
 export const serviceDescriptors: ServiceDescriptor[] = [
   {
     id: 'shadowsocks',
@@ -120,5 +143,20 @@ export const serviceDescriptors: ServiceDescriptor[] = [
     },
     useStart: useWgStartMutation,
     useStop: useWgStopMutation,
+  },
+  {
+    id: 'proxy',
+    name: 'Proxy',
+    description: 'SOCKS5 + HTTP CONNECT on independent ports, per-user auth.',
+    useStatusQuery: () => {
+      const q = useProxyStatusQuery();
+      return {
+        data: q.data ? proxyStatusToCommon(q.data) : undefined,
+        isLoading: q.isLoading,
+        error: q.error ?? null,
+      };
+    },
+    useStart: useProxyStartMutation,
+    useStop: useProxyStopMutation,
   },
 ];

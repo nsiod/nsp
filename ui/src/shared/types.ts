@@ -19,6 +19,7 @@ export interface StatusResponse {
   version: string;
   ss_enabled: boolean;
   wg_enabled: boolean;
+  proxy_enabled: boolean;
 }
 
 // ---- Users ----
@@ -29,6 +30,7 @@ export interface UserEntry {
   created_at: number;
   ss_enabled: boolean;
   wg_enabled: boolean;
+  proxy_enabled: boolean;
   note?: string | null;
 }
 
@@ -63,6 +65,43 @@ export interface UserSsDetail {
   name: string;
   created_at: number;
   url: string;
+}
+
+/** `POST /api/users/:id/proxy[/rotate]` response. */
+export interface UserProxyEnabled {
+  user_id: string;
+  name: string;
+  username: string;
+  /** One-shot password; the server never returns plaintext again. */
+  password: string;
+  socks5_url: string;
+  http_url: string;
+  pending: boolean;
+}
+
+/** `GET /api/users/:id/proxy` — no password. */
+export interface UserProxyDetail {
+  user_id: string;
+  name: string;
+  username: string;
+  socks5_url: string;
+  http_url: string;
+  created_at: number;
+  updated_at: number;
+}
+
+// ---- Proxy (protocol status only) ----
+
+export interface ProxyStatus {
+  running: boolean;
+  socks5_port: number;
+  http_port: number;
+  public_host: string;
+  users: number;
+  reload_count: number;
+  last_swap_ms: number;
+  available: boolean;
+  reason?: string | null;
 }
 
 // ---- Shadowsocks (protocol status only) ----

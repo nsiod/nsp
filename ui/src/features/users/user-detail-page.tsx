@@ -1,18 +1,22 @@
 import type { SecretBlock } from '@/features/users/components/secret-reveal';
-import type { UserSsEnabled, UserWgEnabled } from '@/shared/types';
+import type { UserProxyEnabled, UserSsEnabled, UserWgEnabled } from '@/shared/types';
 import { Link, useNavigate, useParams } from '@tanstack/react-router';
 import { ArrowLeft, KeyRound, RefreshCw, Trash2 } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useSsStatusQuery, useWgStatusQuery } from '@/features/services/api';
+import { useProxyStatusQuery, useSsStatusQuery, useWgStatusQuery } from '@/features/services/api';
 import {
   useDeleteUserMutation,
+  useDisableUserProxyMutation,
   useDisableUserSsMutation,
   useDisableUserWgMutation,
+  useEnableUserProxyMutation,
   useEnableUserSsMutation,
   useEnableUserWgMutation,
+  useRotateUserProxyMutation,
   useRotateUserSsMutation,
   useRotateUserWgMutation,
+  useUserProxyDetailQuery,
   useUsersQuery,
   useUserSsDetailQuery,
   useUserWgDetailQuery,
@@ -37,10 +41,14 @@ export function UserDetailPage() {
   const users = useUsersQuery();
   const ssStatus = useSsStatusQuery();
   const wgStatus = useWgStatusQuery();
+  const proxyStatus = useProxyStatusQuery();
   const user = useMemo(() => users.data?.find((u) => u.name === decoded), [users.data, decoded]);
 
   const ssDetail = useUserSsDetailQuery(user?.id ?? '', { enabled: !!user?.ss_enabled });
   const wgDetail = useUserWgDetailQuery(user?.id ?? '', { enabled: !!user?.wg_enabled });
+  const proxyDetail = useUserProxyDetailQuery(user?.id ?? '', {
+    enabled: !!user?.proxy_enabled,
+  });
 
   const enableSs = useEnableUserSsMutation();
   const disableSs = useDisableUserSsMutation();
@@ -48,6 +56,9 @@ export function UserDetailPage() {
   const enableWg = useEnableUserWgMutation();
   const disableWg = useDisableUserWgMutation();
   const rotateWg = useRotateUserWgMutation();
+  const enableProxy = useEnableUserProxyMutation();
+  const disableProxy = useDisableUserProxyMutation();
+  const rotateProxy = useRotateUserProxyMutation();
   const deleteUser = useDeleteUserMutation();
   // Two flavours of "unavailable":
   //   - absent  → driver isn't loaded at all (boot config disabled it).
@@ -62,8 +73,20 @@ export function UserDetailPage() {
   const ssPaused = !ssAbsent && ssStatus.data?.available === false;
   const wgAbsent = wgStatus.error?.isUnavailable() ?? false;
   const wgPaused = !wgAbsent && wgStatus.data?.available === false;
+  const proxyAbsent = proxyStatus.error?.isUnavailable() ?? false;
+  // The proxy status endpoint never 503s (it returns
+  // `available:false` instead, mirroring SS/WG), so use the data flag
+  // as the "absent" signal. Reasoning split into discrete predicates
+  // to keep the boolean precedence unambiguous.
+  const proxyData = proxyStatus.data;
+  const proxyDriverGone = proxyAbsent
+    || (proxyData?.available === false
+      && proxyData?.running === false
+      && (proxyData?.reason?.includes('disabled in configuration') ?? false));
+  const proxyPaused = !proxyDriverGone && proxyData?.available === false;
   const ssUnavailable = ssAbsent;
   const wgUnavailable = wgAbsent;
+  const proxyUnavailable = !!proxyDriverGone;
 
   const [reveal, setReveal] = useState<{ title: string; blocks: SecretBlock[] } | null>(null);
 
@@ -91,6 +114,40 @@ export function UserDetailPage() {
           label: t('userDetail.reveal.serverPsk'),
           value: m.server_psk,
           filename: `${slug(m.name)}.server-psk.txt`,
+          advanced: true,
+        },
+      ],
+    });
+  };
+
+  const showProxy = (m: UserProxyEnabled, kind: 'created' | 'rotated') => {
+    const titleKey
+      = kind === 'created'
+        ? 'userDetail.proxy.revealCreated'
+        : 'userDetail.proxy.revealRotated';
+    setReveal({
+      title: t(titleKey, { name: m.name }),
+      blocks: [
+        {
+          label: t('userDetail.reveal.socks5Url'),
+          value: m.socks5_url,
+          filename: `${slug(m.name)}.socks5.txt`,
+        },
+        {
+          label: t('userDetail.reveal.httpUrl'),
+          value: m.http_url,
+          filename: `${slug(m.name)}.http.txt`,
+        },
+        {
+          label: t('userDetail.reveal.proxyUsername'),
+          value: m.username,
+          filename: `${slug(m.name)}.proxy-user.txt`,
+          advanced: true,
+        },
+        {
+          label: t('userDetail.reveal.proxyPassword'),
+          value: m.password,
+          filename: `${slug(m.name)}.proxy-pass.txt`,
           advanced: true,
         },
       ],
@@ -163,7 +220,7 @@ export function UserDetailPage() {
         </div>
       </div>
 
-      <div className="grid gap-4 lg:grid-cols-2">
+      <div className="grid gap-4 lg:grid-cols-2 xl:grid-cols-3">
         <ProtocolCard
           title={t('userDetail.shadowsocks.title')}
           subtitle={t('userDetail.shadowsocks.subtitle')}
@@ -273,6 +330,54 @@ export function UserDetailPage() {
           togglePending={wgUnavailable || enableWg.isPending || disableWg.isPending}
           actionDisabled={wgUnavailable}
           pausedNotice={wgPaused ? t('userDetail.paused') : undefined}
+        />
+
+        <ProtocolCard
+          title={t('userDetail.proxy.title')}
+          subtitle={t('userDetail.proxy.subtitle')}
+          enabled={user.proxy_enabled}
+          metaRows={
+            user.proxy_enabled
+              ? [
+                  [t('userDetail.proxy.meta.username'), proxyDetail.data?.username ?? '—'],
+                  [t('userDetail.proxy.meta.socks5'), proxyDetail.data?.socks5_url ?? '—'],
+                  [t('userDetail.proxy.meta.http'), proxyDetail.data?.http_url ?? '—'],
+                ]
+              : []
+          }
+          actionLabel={
+            user.proxy_enabled ? t('userDetail.proxy.rotate') : t('userDetail.proxy.enable')
+          }
+          onToggle={(next) => {
+            if (next && !user.proxy_enabled) {
+              enableProxy.mutate(user.id, {
+                onSuccess: (m) => showProxy(m, 'created'),
+                onError: (e) => toaster.error(t('userDetail.toasts.enableProxyFailed'), e.message),
+              });
+            }
+            else if (!next && user.proxy_enabled) {
+              if (!window.confirm(t('userDetail.proxy.confirmDisable')))
+                return;
+              disableProxy.mutate(user.id, {
+                onError: (e) =>
+                  toaster.error(t('userDetail.toasts.disableProxyFailed'), e.message),
+              });
+            }
+          }}
+          onAction={() => {
+            if (!user.proxy_enabled)
+              return;
+            if (!window.confirm(t('userDetail.proxy.confirmRotate')))
+              return;
+            rotateProxy.mutate(user.id, {
+              onSuccess: (m) => showProxy(m, 'rotated'),
+              onError: (e) => toaster.error(t('userDetail.toasts.rotateFailed'), e.message),
+            });
+          }}
+          actionPending={enableProxy.isPending || rotateProxy.isPending}
+          togglePending={proxyUnavailable || enableProxy.isPending || disableProxy.isPending}
+          actionDisabled={proxyUnavailable}
+          pausedNotice={proxyPaused ? t('userDetail.paused') : undefined}
         />
       </div>
 

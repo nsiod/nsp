@@ -4,7 +4,7 @@
 
 import type { UseQueryOptions } from '@tanstack/react-query';
 import type { ApiError } from '@/shared/lib/http';
-import type { SsStatus, StatusResponse, WgStatus } from '@/shared/types';
+import type { ProxyStatus, SsStatus, StatusResponse, WgStatus } from '@/shared/types';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiRequest } from '@/shared/lib/http';
 import { queryKeys } from '@/shared/lib/query-keys';
@@ -75,6 +75,37 @@ export function useWgStopMutation() {
     mutationFn: () => apiRequest<void>('/api/protocol/wg/stop', { method: 'POST' }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: queryKeys.wgStatus });
+      qc.invalidateQueries({ queryKey: queryKeys.status });
+    },
+  });
+}
+
+export function useProxyStatusQuery(opts?: Partial<UseQueryOptions<ProxyStatus, ApiError>>) {
+  return useQuery<ProxyStatus, ApiError>({
+    queryKey: queryKeys.proxyStatus,
+    queryFn: () => apiRequest<ProxyStatus>('/api/protocol/proxy/status'),
+    refetchInterval: 15_000,
+    ...opts,
+  });
+}
+
+export function useProxyStartMutation() {
+  const qc = useQueryClient();
+  return useMutation<void, ApiError, void>({
+    mutationFn: () => apiRequest<void>('/api/protocol/proxy/start', { method: 'POST' }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.proxyStatus });
+      qc.invalidateQueries({ queryKey: queryKeys.status });
+    },
+  });
+}
+
+export function useProxyStopMutation() {
+  const qc = useQueryClient();
+  return useMutation<void, ApiError, void>({
+    mutationFn: () => apiRequest<void>('/api/protocol/proxy/stop', { method: 'POST' }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.proxyStatus });
       qc.invalidateQueries({ queryKey: queryKeys.status });
     },
   });

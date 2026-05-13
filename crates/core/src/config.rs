@@ -175,6 +175,15 @@ pub struct ProxyServerConfig {
     /// Debounce window (ms) for coalescing apply bursts.
     #[serde(default = "default_proxy_apply_debounce_ms")]
     pub apply_debounce_ms: u64,
+    /// Also reject RFC1918 / IPv6 ULA CONNECT destinations. Default
+    /// `false`: typical deployment lets users reach LAN / WG-internal
+    /// hosts. Flip to `true` for "public internet only".
+    #[serde(default)]
+    pub block_private_destinations: bool,
+    /// Global concurrent-connection ceiling shared across both
+    /// listeners. `0` falls back to the driver default.
+    #[serde(default = "default_proxy_max_inflight")]
+    pub max_inflight: usize,
 }
 
 impl Default for ProxyServerConfig {
@@ -185,12 +194,18 @@ impl Default for ProxyServerConfig {
             socks5_port: 1080,
             http_port: 8080,
             apply_debounce_ms: default_proxy_apply_debounce_ms(),
+            block_private_destinations: false,
+            max_inflight: default_proxy_max_inflight(),
         }
     }
 }
 
 fn default_proxy_apply_debounce_ms() -> u64 {
     500
+}
+
+fn default_proxy_max_inflight() -> usize {
+    4096
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

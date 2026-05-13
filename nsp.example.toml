@@ -52,6 +52,11 @@ bind = "0.0.0.0"
 socks5_port = 1080
 http_port = 8080
 apply_debounce_ms = 500
+# Reject CONNECT to RFC1918 / IPv6 ULA as well — `false` keeps the
+# default that lets users reach LAN / WG-internal hosts.
+block_private_destinations = false
+# Global concurrent-connection ceiling across both listeners.
+max_inflight = 4096
 
 [logging]
 level = "info"

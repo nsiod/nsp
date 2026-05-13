@@ -172,13 +172,15 @@ async fn run_serve(args: cli::ServeArgs) -> anyhow::Result<()> {
             .domain
             .clone()
             .unwrap_or_else(|| config.proxy.bind.to_string());
-        let proxy_cfg = ProxyDriverConfig::new(
+        let mut proxy_cfg = ProxyDriverConfig::new(
             config.proxy.bind,
             config.proxy.socks5_port,
             config.proxy.http_port,
             host,
             config.proxy.apply_debounce_ms,
         );
+        proxy_cfg.block_private_destinations = config.proxy.block_private_destinations;
+        proxy_cfg.max_inflight = config.proxy.max_inflight;
         let proxy = ProxyDriver::new(proxy_cfg, pool.clone(), master_key);
         match proxy.start().await {
             Ok(()) => tracing::info!("proxy driver up"),

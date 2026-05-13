@@ -84,6 +84,13 @@ pub struct ProxyDriverConfig {
     /// default blocks proxying to the colocated admin API and to cloud
     /// metadata endpoints (IMDS at 169.254.169.254).
     pub allow_loopback_destinations: bool,
+    /// Also block RFC1918 (10/8, 172.16/12, 192.168/16) and IPv6 ULA
+    /// (fc00::/7) destinations. Default `false` — the common deployment
+    /// is to let users reach LAN / WireGuard-internal hosts. Set to
+    /// `true` when the proxy should only egress to the public internet.
+    pub block_private_destinations: bool,
+    /// Global concurrent-connection ceiling. See `DEFAULT_MAX_INFLIGHT`.
+    pub max_inflight: usize,
 }
 
 impl ProxyDriverConfig {
@@ -101,6 +108,8 @@ impl ProxyDriverConfig {
             public_host,
             debounce: Duration::from_millis(debounce_ms),
             allow_loopback_destinations: false,
+            block_private_destinations: false,
+            max_inflight: DEFAULT_MAX_INFLIGHT,
         }
     }
 }
@@ -171,6 +180,7 @@ pub(crate) type AuthMap = Arc<RwLock<HashMap<String, [u8; PASSWORD_LEN]>>>;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DestinationPolicy {
     pub(crate) allow_loopback: bool,
+    pub(crate) block_private: bool,
 }
 
 impl DestinationPolicy {
@@ -180,14 +190,22 @@ impl DestinationPolicy {
         }
         match ip {
             std::net::IpAddr::V4(v4) => {
-                v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
+                if v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() {
+                    return true;
+                }
+                self.block_private && v4.is_private()
             }
             std::net::IpAddr::V6(v6) => {
-                v6.is_loopback()
+                if v6.is_loopback()
                     || v6.is_unspecified()
                     // is_unicast_link_local is unstable; check the
                     // prefix directly: fe80::/10.
                     || (v6.segments()[0] & 0xffc0) == 0xfe80
+                {
+                    return true;
+                }
+                // IPv6 ULA: fc00::/7 (covers fc00::/8 and fd00::/8).
+                self.block_private && (v6.segments()[0] & 0xfe00) == 0xfc00
             }
         }
     }
@@ -269,9 +287,14 @@ impl ProxyDriver {
             availability_cache: RwLock::new(None),
             reconcile_notify: RwLock::new(None),
             auth: Arc::new(RwLock::new(HashMap::new())),
-            inflight: Arc::new(Semaphore::new(DEFAULT_MAX_INFLIGHT)),
+            inflight: Arc::new(Semaphore::new(if config.max_inflight == 0 {
+                DEFAULT_MAX_INFLIGHT
+            } else {
+                config.max_inflight
+            })),
             destination_policy: DestinationPolicy {
                 allow_loopback: config.allow_loopback_destinations,
+                block_private: config.block_private_destinations,
             },
         });
         Self { inner }
@@ -832,11 +855,7 @@ impl ReconcileTarget for ProxyDriver {
 #[async_trait]
 impl Driver for ProxyDriver {
     fn protocol(&self) -> ProtocolKind {
-        // The shared `ProtocolKind` enum does not currently have a
-        // dedicated `Proxy` variant. Surface this as `Shadowsocks` for
-        // the legacy `Driver::status` payload; the dedicated
-        // `/api/protocol/proxy/status` route returns the real snapshot.
-        ProtocolKind::Shadowsocks
+        ProtocolKind::Proxy
     }
 
     async fn spawn(&self) -> CoreResult<()> {
@@ -849,7 +868,7 @@ impl Driver for ProxyDriver {
     async fn status(&self) -> CoreResult<DriverStatus> {
         let snap = ProxyDriver::status(self).await;
         Ok(DriverStatus {
-            protocol: ProtocolKind::Shadowsocks,
+            protocol: ProtocolKind::Proxy,
             running: snap.running,
             listen_port: Some(snap.socks5_port),
             active_clients: snap.users,
@@ -894,6 +913,7 @@ mod tests {
     fn destination_policy_blocks_loopback_and_link_local_by_default() {
         let policy = DestinationPolicy {
             allow_loopback: false,
+            block_private: false,
         };
         // IPv4
         assert!(policy.blocks("127.0.0.1".parse().unwrap()));
@@ -918,8 +938,29 @@ mod tests {
     fn destination_policy_allow_loopback_disables_filter() {
         let policy = DestinationPolicy {
             allow_loopback: true,
+            block_private: false,
         };
         assert!(!policy.blocks("127.0.0.1".parse().unwrap()));
         assert!(!policy.blocks("169.254.169.254".parse().unwrap()));
+    }
+
+    #[test]
+    fn destination_policy_block_private_extends_filter() {
+        let policy = DestinationPolicy {
+            allow_loopback: false,
+            block_private: true,
+        };
+        // RFC1918 now refused.
+        assert!(policy.blocks("10.0.0.1".parse().unwrap()));
+        assert!(policy.blocks("192.168.1.1".parse().unwrap()));
+        assert!(policy.blocks("172.16.0.1".parse().unwrap()));
+        // ULA refused.
+        assert!(policy.blocks("fc00::1".parse().unwrap()));
+        assert!(policy.blocks("fd12:3456:789a::1".parse().unwrap()));
+        // Loopback & link-local still refused.
+        assert!(policy.blocks("127.0.0.1".parse().unwrap()));
+        // Public still allowed.
+        assert!(!policy.blocks("1.1.1.1".parse().unwrap()));
+        assert!(!policy.blocks("2606:4700:4700::1111".parse().unwrap()));
     }
 }

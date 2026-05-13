@@ -6,17 +6,18 @@
 //! sub-negotiation compares the password in constant time against the
 //! shared in-memory auth map.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use subtle::ConstantTimeEq;
 use tokio::{
     io::{self, AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::{lookup_host, TcpListener, TcpStream},
+    sync::Semaphore,
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::driver::AuthMap;
+use crate::driver::{AuthMap, DestinationPolicy};
 
 const VER_SOCKS5: u8 = 0x05;
 const VER_USERPASS: u8 = 0x01;
@@ -42,6 +43,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 pub(crate) async fn run_socks5_listener(
     listener: TcpListener,
     auth: AuthMap,
+    inflight: Arc<Semaphore>,
+    policy: DestinationPolicy,
     cancel: CancellationToken,
 ) {
     let local = listener.local_addr().ok();
@@ -52,10 +55,26 @@ pub(crate) async fn run_socks5_listener(
             accept = listener.accept() => {
                 match accept {
                     Ok((stream, peer)) => {
+                        // Drop the connection immediately when the
+                        // global inflight ceiling is reached — this is
+                        // what bounds the slowloris blast radius.
+                        let permit = match inflight.clone().try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                tracing::warn!(
+                                    target: "nsp::proxy",
+                                    %peer,
+                                    "socks5 inflight cap reached; dropping connection"
+                                );
+                                drop(stream);
+                                continue;
+                            }
+                        };
                         let auth = auth.clone();
                         let cancel = cancel.clone();
                         tokio::spawn(async move {
-                            if let Err(err) = handle_socks5(stream, auth, cancel).await {
+                            let _permit = permit;
+                            if let Err(err) = handle_socks5(stream, auth, policy, cancel).await {
                                 tracing::debug!(
                                     target: "nsp::proxy",
                                     %peer,
@@ -78,6 +97,7 @@ pub(crate) async fn run_socks5_listener(
 async fn handle_socks5(
     mut stream: TcpStream,
     auth: AuthMap,
+    policy: DestinationPolicy,
     cancel: CancellationToken,
 ) -> io::Result<()> {
     let (host, port) = match timeout(HANDSHAKE_TIMEOUT, handshake(&mut stream, &auth)).await {
@@ -85,20 +105,20 @@ async fn handle_socks5(
         Err(_) => return Err(io_other("socks5 handshake timeout")),
     };
 
-    // Resolve + connect outside the handshake timeout: target latency
-    // depends on the upstream, not the client.
-    let target = format!("{host}:{port}");
-    let connect_res = timeout(CONNECT_TIMEOUT, TcpStream::connect(&target)).await;
-    let mut upstream = match connect_res {
-        Ok(Ok(s)) => s,
-        Ok(Err(err)) => {
-            let rep = io_error_to_socks5_rep(&err);
+    // Resolve + filter + connect outside the handshake timeout: target
+    // latency depends on the upstream, not the client. Resolution-first
+    // prevents DNS rebinding (a public name pointing at 127.0.0.1).
+    let mut upstream = match resolve_and_connect(&host, port, policy).await {
+        Ok(s) => s,
+        Err(err) => {
+            let rep = match err.kind() {
+                io::ErrorKind::PermissionDenied => REP_GENERAL_FAILURE,
+                io::ErrorKind::ConnectionRefused => REP_CONNECTION_REFUSED,
+                io::ErrorKind::TimedOut | io::ErrorKind::NotFound => REP_HOST_UNREACHABLE,
+                _ => REP_GENERAL_FAILURE,
+            };
             let _ = reply(&mut stream, rep).await;
             return Err(err);
-        }
-        Err(_) => {
-            let _ = reply(&mut stream, REP_HOST_UNREACHABLE).await;
-            return Err(io_other("connect timeout"));
         }
     };
 
@@ -229,12 +249,47 @@ fn io_other(msg: &'static str) -> io::Error {
     io::Error::other(msg)
 }
 
-fn io_error_to_socks5_rep(err: &io::Error) -> u8 {
-    match err.kind() {
-        io::ErrorKind::ConnectionRefused => REP_CONNECTION_REFUSED,
-        io::ErrorKind::TimedOut | io::ErrorKind::NotFound => REP_HOST_UNREACHABLE,
-        _ => REP_GENERAL_FAILURE,
+/// Look up `host:port`, reject any address that hits the blocked-
+/// destination filter, then connect to the first surviving address with
+/// the connect timeout applied. Errors carry `PermissionDenied` when a
+/// destination was filtered so the caller can map it to a SOCKS5 REP.
+pub(crate) async fn resolve_and_connect(
+    host: &str,
+    port: u16,
+    policy: DestinationPolicy,
+) -> io::Result<TcpStream> {
+    let target = format!("{host}:{port}");
+    let addrs = lookup_host(target.as_str())
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::NotFound, format!("resolve {target}: {e}")))?
+        .collect::<Vec<_>>();
+    if addrs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no addresses for {target}"),
+        ));
     }
+    if addrs.iter().any(|a| policy.blocks(a.ip())) {
+        tracing::warn!(
+            target: "nsp::proxy",
+            host,
+            "blocked proxy destination (loopback / link-local / metadata)"
+        );
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "destination blocked by policy",
+        ));
+    }
+    // Try each survivor in turn; bail on the first success.
+    let mut last_err: Option<io::Error> = None;
+    for addr in addrs {
+        match timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+            Ok(Ok(s)) => return Ok(s),
+            Ok(Err(e)) => last_err = Some(e),
+            Err(_) => last_err = Some(io::Error::new(io::ErrorKind::TimedOut, "connect timeout")),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| io::Error::other("unknown connect failure")))
 }
 
 #[cfg(test)]

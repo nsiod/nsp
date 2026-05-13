@@ -139,13 +139,14 @@ mod tests {
         );
         let ss = SsDriver::new(ss_cfg, db.clone(), master_key.clone());
         state = state.with_ss_driver(ss);
-        let proxy_cfg = ProxyDriverConfig::new(
+        let mut proxy_cfg = ProxyDriverConfig::new(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             0,
             0,
             "127.0.0.1".to_owned(),
             1,
         );
+        proxy_cfg.allow_loopback_destinations = true;
         let proxy = ProxyDriver::new(proxy_cfg, db, master_key);
         state = state.with_proxy(proxy);
         Arc::new(state)

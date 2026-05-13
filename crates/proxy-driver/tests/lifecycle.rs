@@ -61,13 +61,15 @@ async fn ephemeral_pool() -> nsp_db::Pool {
 async fn fresh_driver_with_user(name: &str) -> (ProxyDriver, String, String, String) {
     let pool = ephemeral_pool().await;
     let master = Arc::new(MasterKey::generate());
-    let cfg = ProxyDriverConfig::new(
+    let mut cfg = ProxyDriverConfig::new(
         IpAddr::V4(Ipv4Addr::LOCALHOST),
         0,
         0,
         "127.0.0.1".to_owned(),
         50,
     );
+    // Loopback echo target; the production default rejects loopback.
+    cfg.allow_loopback_destinations = true;
     let driver = ProxyDriver::new(cfg, pool.clone(), master);
 
     let user_id = Uuid::now_v7().to_string();
@@ -369,6 +371,46 @@ async fn http_bad_auth_returns_407() {
     }
     let text = std::str::from_utf8(&buf).unwrap();
     assert!(text.starts_with("HTTP/1.1 407"), "got: {text}");
+
+    driver.stop().await.expect("stop");
+}
+
+#[tokio::test]
+async fn socks5_blocks_loopback_by_default() {
+    // Driver with the default destination policy MUST refuse to relay
+    // to 127.0.0.1, otherwise an authenticated user can reach the
+    // colocated admin API.
+    let pool = ephemeral_pool().await;
+    let master = Arc::new(MasterKey::generate());
+    let cfg = ProxyDriverConfig::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        0,
+        0,
+        "127.0.0.1".to_owned(),
+        50,
+    );
+    // Note: NOT setting allow_loopback_destinations — production default.
+    let driver = ProxyDriver::new(cfg, pool.clone(), master);
+    let user_id = Uuid::now_v7().to_string();
+    UsersRepo::new(&pool)
+        .create(&user_id, "isobel", None)
+        .await
+        .unwrap();
+    driver.start().await.expect("start");
+    let material = driver.enable_user(&user_id).await.expect("enable");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let proxy_port = driver.socks5_port().await;
+    let proxy = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), proxy_port);
+
+    // Reach the SOCKS5 handshake to CONNECT to 127.0.0.1:1 — expect
+    // REP=0x01 (general failure) because the destination is policy-blocked.
+    let echo_target = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+    let res = socks5_connect(proxy, &material.username, &material.password, echo_target).await;
+    assert!(
+        res.is_err(),
+        "default policy must reject loopback destinations"
+    );
 
     driver.stop().await.expect("stop");
 }

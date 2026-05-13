@@ -226,6 +226,19 @@ Password handling notes:
   the new value through the apply loop; existing clients stop working
   within one debounce window (default 500 ms).
 
+Built-in safety rails (always on, no config knob):
+
+* **Destination filter**: every CONNECT target is resolved through DNS,
+  then any address in `127.0.0.0/8`, `169.254.0.0/16`, `0.0.0.0/8`, `::1`,
+  `::`, or `fe80::/10` is refused (`SOCKS5 REP=0x01` / `HTTP 403`). This
+  blocks pivoting to the colocated admin API, cloud metadata endpoints
+  (IMDS at `169.254.169.254`), and DNS-rebinding attacks. RFC1918 / ULA
+  ranges are NOT blocked because pointing users at LAN / WireGuard-
+  internal hosts is a common deployment.
+* **Connection ceiling**: each listener caps the global in-flight count
+  at 4096 sockets. Beyond that, new TCP accepts are closed immediately,
+  bounding slowloris-style memory / FD exhaustion.
+
 ---
 
 ## Observability

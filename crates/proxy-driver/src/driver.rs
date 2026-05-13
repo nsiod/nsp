@@ -27,7 +27,7 @@ use nsp_db::{Pool, ProxyRepo, UsersRepo};
 use rand::{rngs::OsRng, RngCore};
 use tokio::{
     net::TcpListener,
-    sync::{mpsc, Notify, RwLock},
+    sync::{mpsc, Notify, RwLock, Semaphore},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -47,6 +47,14 @@ pub const USERNAME_LEN: usize = 16;
 
 /// Default debounce window for coalescing apply bursts.
 pub const DEFAULT_APPLY_DEBOUNCE_MS: u64 = 500;
+
+/// Per-listener cap on concurrent in-flight connections. Bounds the
+/// worst-case memory blast radius of a slowloris-style flood — each
+/// half-open handshake allocates only a small read buffer, but with
+/// no ceiling an attacker could exhaust file descriptors. 4096 is
+/// generous for a self-hosted proxy and prevents the file table from
+/// dominating sizing decisions on small hosts.
+pub const DEFAULT_MAX_INFLIGHT: usize = 4096;
 
 /// Alphabet used for usernames and passwords: digits + ASCII letters.
 /// Excludes URL-special characters so the strings can be safely
@@ -71,6 +79,11 @@ pub struct ProxyDriverConfig {
     pub http_port: u16,
     pub public_host: String,
     pub debounce: Duration,
+    /// Disable the loopback / link-local destination filter. **Tests
+    /// only.** Production callers should leave this `false` — the
+    /// default blocks proxying to the colocated admin API and to cloud
+    /// metadata endpoints (IMDS at 169.254.169.254).
+    pub allow_loopback_destinations: bool,
 }
 
 impl ProxyDriverConfig {
@@ -87,6 +100,7 @@ impl ProxyDriverConfig {
             http_port,
             public_host,
             debounce: Duration::from_millis(debounce_ms),
+            allow_loopback_destinations: false,
         }
     }
 }
@@ -148,6 +162,37 @@ struct Listen {
 /// can take a fresh `RwLock::read()` per request without races.
 pub(crate) type AuthMap = Arc<RwLock<HashMap<String, [u8; PASSWORD_LEN]>>>;
 
+/// Destination policy applied to every CONNECT target after DNS
+/// resolution but before the upstream `connect()`. The default policy
+/// blocks loopback and link-local addresses (would expose the
+/// colocated admin API and cloud IMDS at 169.254.169.254); RFC1918 /
+/// ULA ranges are NOT blocked because a common deployment is to point
+/// users at LAN / WireGuard-internal hosts.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DestinationPolicy {
+    pub(crate) allow_loopback: bool,
+}
+
+impl DestinationPolicy {
+    pub(crate) fn blocks(&self, ip: std::net::IpAddr) -> bool {
+        if self.allow_loopback {
+            return false;
+        }
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
+            }
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    // is_unicast_link_local is unstable; check the
+                    // prefix directly: fe80::/10.
+                    || (v6.segments()[0] & 0xffc0) == 0xfe80
+            }
+        }
+    }
+}
+
 struct Inner {
     db: Pool,
     master_key: Arc<MasterKey>,
@@ -159,6 +204,13 @@ struct Inner {
     availability_cache: RwLock<Option<(Instant, Availability)>>,
     reconcile_notify: RwLock<Option<Arc<Notify>>>,
     auth: AuthMap,
+    /// Global concurrent-connection ceiling. Slowloris-style flooders
+    /// hold many half-open sockets; without a cap the OS file table
+    /// becomes a denial-of-service vector. Each accepted connection
+    /// acquires one permit; the permit is released when its task ends.
+    inflight: Arc<Semaphore>,
+    /// Destination filter applied to every CONNECT target.
+    destination_policy: DestinationPolicy,
 }
 
 struct ApplyChannel {
@@ -217,6 +269,10 @@ impl ProxyDriver {
             availability_cache: RwLock::new(None),
             reconcile_notify: RwLock::new(None),
             auth: Arc::new(RwLock::new(HashMap::new())),
+            inflight: Arc::new(Semaphore::new(DEFAULT_MAX_INFLIGHT)),
+            destination_policy: DestinationPolicy {
+                allow_loopback: config.allow_loopback_destinations,
+            },
         });
         Self { inner }
     }
@@ -447,18 +503,65 @@ impl ProxyDriver {
     /// Bring the driver up: spawn the SOCKS5 and HTTP listener tasks,
     /// the apply loop, and seed the in-memory auth map from the DB.
     /// Safe to re-call after a prior `stop()`.
+    ///
+    /// Failure semantics: if any step fails, the driver is restored to
+    /// `running=false` with the auth map cleared and any half-spawned
+    /// task awaited so callers can retry without observing a half-started
+    /// "running but unreachable" state.
     pub async fn start(&self) -> Result<(), ProxyError> {
         if self.is_running().await {
             return Ok(());
         }
-        // Mark running before spawning listeners so that observers see a
-        // consistent state if `apply_all` runs early.
+        // Prime the auth map BEFORE the listeners come up so the first
+        // connection after `start` never races an empty map. The apply
+        // loop is still spawned to handle subsequent reconciler ticks.
+        self.sync_from_db().await?;
+        if let Err(err) = self.spawn_listeners().await {
+            self.rollback_start().await;
+            return Err(err);
+        }
+        if let Err(err) = self.spawn_apply_loop().await {
+            self.rollback_start().await;
+            return Err(err);
+        }
+        // Mark running only after every fallible step succeeded; this
+        // keeps `status()` consistent with reality if any of the spawns
+        // above had failed.
         self.inner.state.write().await.running = true;
-        self.spawn_listeners().await?;
-        self.spawn_apply_loop().await?;
-        self.apply_all().await?;
         self.notify_reconciler().await;
         Ok(())
+    }
+
+    /// Tear down whatever subset of `start()` succeeded so the driver
+    /// reverts to a clean stopped state. Idempotent.
+    async fn rollback_start(&self) {
+        let (cancel, socks5_task, http_task, apply_task) = {
+            let mut s = self.inner.state.write().await;
+            s.running = false;
+            s.active_users = 0;
+            (
+                s.cancel.take(),
+                s.socks5_task.take(),
+                s.http_task.take(),
+                s.apply_task.take(),
+            )
+        };
+        if let Some(c) = cancel {
+            c.cancel();
+        }
+        if let Some(t) = socks5_task {
+            let _ = t.await;
+        }
+        if let Some(t) = http_task {
+            let _ = t.await;
+        }
+        if let Some(t) = apply_task {
+            t.abort();
+            let _ = t.await;
+        }
+        *self.inner.apply_ch.write().await = ApplyChannel::fresh();
+        self.inner.auth.write().await.clear();
+        self.inner.metrics.active_users.store(0, Ordering::Relaxed);
     }
 
     /// Cancel both listener tasks and the apply loop. Idempotent.
@@ -594,13 +697,24 @@ impl ProxyDriver {
         let http_cancel = cancel.clone();
         let socks5_auth = self.inner.auth.clone();
         let http_auth = self.inner.auth.clone();
+        let socks5_inflight = self.inner.inflight.clone();
+        let http_inflight = self.inner.inflight.clone();
+        let socks5_policy = self.inner.destination_policy;
+        let http_policy = self.inner.destination_policy;
 
-        let socks5_task =
-            tokio::spawn(
-                async move { run_socks5_listener(socks5, socks5_auth, socks5_cancel).await },
-            );
-        let http_task =
-            tokio::spawn(async move { run_http_listener(http, http_auth, http_cancel).await });
+        let socks5_task = tokio::spawn(async move {
+            run_socks5_listener(
+                socks5,
+                socks5_auth,
+                socks5_inflight,
+                socks5_policy,
+                socks5_cancel,
+            )
+            .await
+        });
+        let http_task = tokio::spawn(async move {
+            run_http_listener(http, http_auth, http_inflight, http_policy, http_cancel).await
+        });
 
         let mut s = self.inner.state.write().await;
         s.cancel = Some(cancel);
@@ -774,5 +888,38 @@ mod tests {
     fn password_array_rejects_wrong_length() {
         assert!(password_array(&[0u8; 5]).is_err());
         assert!(password_array(&[0u8; PASSWORD_LEN]).is_ok());
+    }
+
+    #[test]
+    fn destination_policy_blocks_loopback_and_link_local_by_default() {
+        let policy = DestinationPolicy {
+            allow_loopback: false,
+        };
+        // IPv4
+        assert!(policy.blocks("127.0.0.1".parse().unwrap()));
+        assert!(policy.blocks("127.5.5.5".parse().unwrap()));
+        assert!(policy.blocks("0.0.0.0".parse().unwrap()));
+        // Cloud metadata.
+        assert!(policy.blocks("169.254.169.254".parse().unwrap()));
+        // RFC1918 is allowed (used for WG-internal targets).
+        assert!(!policy.blocks("10.0.0.1".parse().unwrap()));
+        assert!(!policy.blocks("192.168.1.1".parse().unwrap()));
+        assert!(!policy.blocks("172.16.0.1".parse().unwrap()));
+        // Public.
+        assert!(!policy.blocks("1.1.1.1".parse().unwrap()));
+        // IPv6
+        assert!(policy.blocks("::1".parse().unwrap()));
+        assert!(policy.blocks("::".parse().unwrap()));
+        assert!(policy.blocks("fe80::1".parse().unwrap()));
+        assert!(!policy.blocks("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn destination_policy_allow_loopback_disables_filter() {
+        let policy = DestinationPolicy {
+            allow_loopback: true,
+        };
+        assert!(!policy.blocks("127.0.0.1".parse().unwrap()));
+        assert!(!policy.blocks("169.254.169.254".parse().unwrap()));
     }
 }

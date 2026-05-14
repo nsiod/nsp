@@ -13,13 +13,18 @@ use thiserror::Error;
 pub mod iptables;
 pub mod repo;
 pub mod settings;
+pub mod traffic;
 
 pub use iptables::{IptablesRepo, IptablesRuleInsert, IptablesRuleRow};
 pub use repo::{
     AuditLogRow, AuditRepo, ProxyCredentialRow, ProxyRepo, ServerConfigRepo, SsRepo, SsUserRow,
-    UserRow, UsersRepo, WgPeerInsert, WgPeerRow, WgRepo,
+    UserRow, UserSource, UsersRepo, WgPeerInsert, WgPeerRow, WgRepo,
 };
 pub use settings::{SettingsPatch, SettingsRepo, SettingsRow};
+pub use traffic::{
+    bucket_for, RecordOutcome, WgTrafficRepo, WgTrafficSample, WgTrafficSummary,
+    TRAFFIC_BUCKET_SECS,
+};
 
 pub type Pool = SqlitePool;
 

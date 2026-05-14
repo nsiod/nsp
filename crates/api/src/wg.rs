@@ -51,6 +51,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<WgStatus>, Ap
             endpoint_host: None,
             available: false,
             reason: Some("wireguard disabled in configuration".to_owned()),
+            backend: String::new(),
         }));
     };
     let s = d.status_view().await?;

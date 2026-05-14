@@ -30,12 +30,25 @@ master_key = ""
 allow_insecure_no_master_key = false
 admin_password = "changeme"
 jwt_ttl_secs = 900
+# Lockdown stance for the /api/* surface (purely a local operator
+# decision — independent of the reverse-API control center):
+#   "enabled"  - full read/write admin surface (default).
+#   "readonly" - GET/HEAD/OPTIONS only; writes return 403. SPA still loads.
+#   "disabled" - HTTP listener is NOT bound at all.
+api = "enabled"
 
 [wireguard]
 enabled = false
 port = 51820
 subnet = "10.255.0.0/16"
 interface = "wg0"
+# Data-plane selector. `kernel` (default) drives the in-kernel
+# wireguard module directly via netlink — no `wg`/`ip` shelling out,
+# the lowest-overhead path. Requires the kernel module loaded and
+# CAP_NET_ADMIN. `userspace` runs the in-process gotatun + TUN
+# implementation when the kernel module is unavailable. `auto` picks
+# `kernel` when its preconditions are met and otherwise falls back.
+backend = "kernel"
 
 [shadowsocks]
 enabled = false
@@ -72,3 +85,25 @@ enabled = true
 interval_secs = 3600
 dir = "/work/backups"
 retention_days = 7
+
+# Reverse-API control center. When enabled, nsp periodically POSTs a
+# self-report (cursor + content hashes + service state) to the
+# configured control plane and reconciles the response into local DB
+# + iptables. Pull-only — the control center never reaches into nsp.
+# Full protocol: docs/control-center.md
+[control]
+enabled = false
+url = "https://control.example.com"
+token = ""
+node_id = "node-001"
+interval_secs = 60
+timeout_secs = 10
+# Cadence of POST /status (independent of /config). Defaults to interval_secs.
+status_interval_secs = 60
+# Conflict resolution for local resources (users + control-source
+# iptables rules) absent from a Full snapshot. Applied uniformly:
+#   "keep"  - additive merge (default): pre-seeded local resources stay.
+#   "prune" - authoritative: delete local extras to match the snapshot.
+# The server can always force hard alignment via mode:"replace" in a
+# single response, regardless of this setting.
+conflict_policy = "keep"

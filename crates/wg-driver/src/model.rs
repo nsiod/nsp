@@ -37,6 +37,12 @@ pub struct PeerCreate {
 /// What a driver caller sees about a peer. All byte fields are base64 encoded
 /// via `serde_with`-style manual wrappers in the API layer; here we stay in
 /// the native types.
+///
+/// `rx_bytes` / `tx_bytes` are the live counters reported by the data
+/// plane — they reset every time the interface is rebuilt. The
+/// `total_*` counterparts are persisted across restarts by the
+/// traffic sampler and reflect the aggregate since the peer was first
+/// observed.
 #[derive(Debug, Clone)]
 pub struct PeerView {
     pub id: String,
@@ -52,6 +58,8 @@ pub struct PeerView {
     pub rx_bytes: u64,
     pub tx_bytes: u64,
     pub last_handshake_secs: Option<u64>,
+    pub total_rx_bytes: u64,
+    pub total_tx_bytes: u64,
 }
 
 /// Exported when a peer is created or rotated — contains one-shot
@@ -80,4 +88,6 @@ pub struct WgStatus {
     /// Human-readable explanation when `available` is false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Effective data-plane backend in use: `userspace` or `kernel`.
+    pub backend: String,
 }

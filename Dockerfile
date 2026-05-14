@@ -22,7 +22,7 @@ RUN rustup target add x86_64-unknown-linux-musl \
 
 # --- Final image ---
 FROM alpine:3.20
-RUN apk add --no-cache iproute2 ca-certificates tini \
+RUN apk add --no-cache iproute2 iptables ca-certificates tini \
  && addgroup -S nsp && adduser -S -G nsp -H -D nsp \
  && mkdir -p /work/data /etc/nsp \
  && chown -R nsp:nsp /work

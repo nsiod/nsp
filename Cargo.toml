@@ -82,7 +82,10 @@ zeroize = { version = "1", features = ["zeroize_derive"] }
 
 # WireGuard.
 # Pinned to mullvad/gotatun main at 9fcc37b (Merge branch 'cookie-source-port').
+# Userspace data plane (TUN + in-process crypto).
 gotatun = { git = "https://github.com/mullvad/gotatun", rev = "9fcc37b2dc4315bcadb0c59d26b93793642710d2", default-features = false, features = ["ring", "tun", "device"] }
+# Kernel data plane (in-kernel `wireguard` module via netlink + rtnetlink).
+defguard_wireguard_rs = { version = "0.9", default-features = false }
 ipnetwork = "0.21"
 qrcode = { version = "0.14", default-features = false, features = ["image"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
@@ -94,6 +97,11 @@ metrics-exporter-prometheus = { version = "0.17", default-features = false }
 # ACME. Pinned to ring backend to avoid dragging in aws-lc-rs and
 # to match the rustls provider used everywhere else.
 rustls-acme = { version = "0.14", default-features = false, features = ["ring", "tls12", "tokio", "axum", "webpki-roots"] }
+
+# Outbound HTTP client used by the control-center poller. Pinned to
+# rustls + webpki-roots without a default crypto provider so the binary
+# keeps using the same `ring` provider installed elsewhere.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "http2"] }
 
 [profile.release]
 lto = "thin"

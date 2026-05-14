@@ -44,6 +44,11 @@ pub struct ProxyConfig {
     /// SQLite online backup scheduler.
     #[serde(default)]
     pub backup: BackupConfig,
+    /// Reverse-API control-center poller. When `enabled = true` the binary
+    /// periodically pulls settings + user list from a remote control plane
+    /// and reconciles them into the local SQLite database.
+    #[serde(default)]
+    pub control: ControlConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -99,6 +104,60 @@ pub struct SecurityConfig {
     /// Explicit local-development escape hatch for running without a master key.
     #[serde(default)]
     pub allow_insecure_no_master_key: bool,
+    /// Lockdown stance for the `/api/*` surface. Independent of
+    /// any control-center configuration; see `docs/api-lockdown.md`.
+    #[serde(default)]
+    pub api: ApiMode,
+}
+
+/// What the `/api/*` admin surface is allowed to do. Set via the
+/// node's local environment (`NSP_API`) — never via the
+/// reverse-API control center, which bypasses the API entirely
+/// and writes through repos directly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+#[clap(rename_all = "lowercase")]
+pub enum ApiMode {
+    /// (Default) Full read/write admin surface. The bundled SPA
+    /// works as expected.
+    #[default]
+    Enabled,
+    /// Read-only: only `GET` / `HEAD` / `OPTIONS` are accepted on
+    /// `/api/*`. All other methods return `403 Forbidden`. The SPA
+    /// still loads and shows current state but cannot mutate it.
+    Readonly,
+    /// Fully disabled: the HTTP listener is not bound at all. The
+    /// admin port doesn't appear in `ss -lntp` / `nmap` output.
+    /// Background tasks (control poller, backup, metrics
+    /// refresher) keep running until SIGINT/SIGTERM.
+    Disabled,
+}
+
+impl ApiMode {
+    #[must_use]
+    pub fn allows_writes(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+
+    #[must_use]
+    pub fn is_disabled(self) -> bool {
+        matches!(self, Self::Disabled)
+    }
+
+    /// True when the binary should bind the HTTP listener (admin
+    /// API + SPA static assets) at startup. False only for
+    /// `Disabled`. Kept as a method so the gating decision lives
+    /// next to the enum and can be tested without a full main.
+    ///
+    /// **Independent of any control-center configuration.** A node
+    /// with `NSP_CONTROL=false` and `NSP_API=disabled` runs truly
+    /// headless (background tasks only). A node with
+    /// `NSP_CONTROL=true` and `NSP_API=enabled` runs both an
+    /// inbound admin surface AND an outbound poller.
+    #[must_use]
+    pub fn binds_listener(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
 }
 
 impl Default for SecurityConfig {
@@ -108,6 +167,7 @@ impl Default for SecurityConfig {
             admin_password: None,
             jwt_ttl_secs: default_jwt_ttl(),
             allow_insecure_no_master_key: false,
+            api: ApiMode::default(),
         }
     }
 }
@@ -218,6 +278,12 @@ pub struct WireguardConfig {
     /// let the driver auto-detect the default-route interface at spawn time.
     #[serde(default)]
     pub wan_interface: Option<String>,
+    /// Data-plane backend selector: `kernel` (in-kernel `wireguard`
+    /// module driven via netlink, **default**), `userspace` (in-process
+    /// gotatun + TUN), or `auto` (prefer kernel, fall back to
+    /// userspace when its preconditions are missing).
+    #[serde(default = "default_wg_backend")]
+    pub backend: String,
 }
 
 impl Default for WireguardConfig {
@@ -228,8 +294,13 @@ impl Default for WireguardConfig {
             subnet: "10.255.0.0/16".to_owned(),
             interface: "wg0".to_owned(),
             wan_interface: None,
+            backend: default_wg_backend(),
         }
     }
+}
+
+fn default_wg_backend() -> String {
+    "kernel".to_owned()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -375,4 +446,176 @@ fn default_backup_dir() -> PathBuf {
 
 fn default_backup_retention_days() -> u32 {
     7
+}
+
+/// Reverse-API ("control center") poller.
+///
+/// When `enabled = true`, the binary periodically pulls a snapshot of
+/// settings + user list + iptables rules from a remote control plane
+/// and reconciles them into the local SQLite database. The poller is
+/// a pure pull model: the control center never reaches into nsp
+/// directly, only nsp reaches out — which keeps the deployment
+/// behind NAT firewall friendly.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ControlConfig {
+    /// Master switch. Defaults off so existing installs are unaffected.
+    pub enabled: bool,
+    /// Base URL of the control center, e.g. `https://control.example.com`.
+    /// The poller appends `/api/v1/nodes/{node_id}/...` to this base.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Bearer token sent in `Authorization: Bearer <token>` to authenticate
+    /// the node against the control center.
+    #[serde(
+        default,
+        deserialize_with = "de_opt_secret",
+        serialize_with = "ser_opt_secret"
+    )]
+    pub token: Option<SecretString>,
+    /// Logical identifier of this node within the control plane. Required
+    /// when `enabled = true`.
+    #[serde(default)]
+    pub node_id: Option<String>,
+    /// Poll interval in seconds.
+    #[serde(default = "default_control_interval_secs")]
+    pub interval_secs: u64,
+    /// Per-request timeout in seconds.
+    #[serde(default = "default_control_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Interval between `POST /status` reports. Independent from
+    /// `interval_secs` (which paces `/config`) so observability data
+    /// can be pushed at a different cadence than configuration sync.
+    /// Defaults to the same value as `interval_secs`.
+    #[serde(default = "default_control_status_interval_secs")]
+    pub status_interval_secs: u64,
+    /// What to do with local resources (users, control-source iptables
+    /// rules) that are absent from a Full server snapshot.
+    /// Server-driven `mode: "replace"` always overrides this on a
+    /// per-response basis.
+    #[serde(default)]
+    pub conflict_policy: ConflictPolicy,
+}
+
+/// How to resolve conflicts between local resources and a Full
+/// snapshot from the control center. Applies uniformly to users
+/// AND control-source iptables rules — a single operator decision
+/// for all reconciled resources.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+#[clap(rename_all = "lowercase")]
+pub enum ConflictPolicy {
+    /// Additive merge: keep local resources that are absent from the
+    /// snapshot. Safe default — the operator can pre-create resources
+    /// locally and the control center won't delete them. The server
+    /// can still force a hard alignment via `mode: "replace"` per
+    /// response.
+    #[default]
+    Keep,
+    /// Authoritative: delete local resources that are absent from
+    /// the snapshot. Equivalent to the server sending `mode: "replace"`
+    /// on every Full snapshot.
+    Prune,
+}
+
+impl ConflictPolicy {
+    /// True when the policy says "delete local extras."
+    #[must_use]
+    pub fn prunes(self) -> bool {
+        matches!(self, Self::Prune)
+    }
+}
+
+impl Default for ControlConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: None,
+            token: None,
+            node_id: None,
+            interval_secs: default_control_interval_secs(),
+            timeout_secs: default_control_timeout_secs(),
+            status_interval_secs: default_control_status_interval_secs(),
+            conflict_policy: ConflictPolicy::default(),
+        }
+    }
+}
+
+fn default_control_interval_secs() -> u64 {
+    60
+}
+
+fn default_control_timeout_secs() -> u64 {
+    10
+}
+
+fn default_control_status_interval_secs() -> u64 {
+    60
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_mode_default_is_enabled() {
+        assert_eq!(ApiMode::default(), ApiMode::Enabled);
+    }
+
+    #[test]
+    fn api_mode_binds_listener_only_when_not_disabled() {
+        assert!(ApiMode::Enabled.binds_listener());
+        assert!(ApiMode::Readonly.binds_listener());
+        assert!(!ApiMode::Disabled.binds_listener());
+    }
+
+    #[test]
+    fn api_mode_writes_only_when_enabled() {
+        assert!(ApiMode::Enabled.allows_writes());
+        assert!(!ApiMode::Readonly.allows_writes());
+        assert!(!ApiMode::Disabled.allows_writes());
+    }
+
+    /// The two switches — `security.api` (inbound admin surface)
+    /// and `control.enabled` (outbound reverse-API poller) — must
+    /// be fully independent. Operators should be able to pick any
+    /// of the six combinations without one implying the other.
+    /// This test pins the independence at the config-default
+    /// level so a future "convenience" link between them gets
+    /// caught.
+    #[test]
+    fn api_and_control_are_independent_switches() {
+        // Default: control off, api enabled.
+        let cfg = ProxyConfig::default();
+        assert!(!cfg.control.enabled);
+        assert_eq!(cfg.security.api, ApiMode::Enabled);
+
+        // Disabling the api must not enable control, or vice versa.
+        let mut cfg = ProxyConfig::default();
+        cfg.security.api = ApiMode::Disabled;
+        assert!(!cfg.control.enabled, "api change leaked into control");
+
+        let mut cfg = ProxyConfig::default();
+        cfg.control.enabled = true;
+        assert_eq!(
+            cfg.security.api,
+            ApiMode::Enabled,
+            "control change leaked into api"
+        );
+
+        // All six combinations are valid configurations.
+        for &(api, ctl) in &[
+            (ApiMode::Enabled, false),
+            (ApiMode::Enabled, true),
+            (ApiMode::Readonly, false),
+            (ApiMode::Readonly, true),
+            (ApiMode::Disabled, false),
+            (ApiMode::Disabled, true),
+        ] {
+            let mut cfg = ProxyConfig::default();
+            cfg.security.api = api;
+            cfg.control.enabled = ctl;
+            assert_eq!(cfg.security.api, api);
+            assert_eq!(cfg.control.enabled, ctl);
+        }
+    }
 }

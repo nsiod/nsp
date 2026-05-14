@@ -55,6 +55,45 @@ impl<'a> ServerConfigRepo<'a> {
     }
 }
 
+/// Origin of a user row. Used as a structural ownership boundary so
+/// the local admin API and the reverse-API control reconciler stay
+/// in their own lanes — see migration `0003_users_source.sql`.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UserSource {
+    /// Created by an admin via `/api/users`. The control reconciler
+    /// must never touch these rows.
+    Local,
+    /// Created/maintained by the reverse-API control center. Local
+    /// PATCH/DELETE handlers refuse to touch these rows.
+    Control,
+}
+
+impl UserSource {
+    #[must_use]
+    pub fn as_tag(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Control => "control",
+        }
+    }
+
+    #[must_use]
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "local" => Some(Self::Local),
+            "control" => Some(Self::Control),
+            _ => None,
+        }
+    }
+}
+
+impl Default for UserSource {
+    fn default() -> Self {
+        Self::Local
+    }
+}
+
 /// A user row decoupled from any protocol enablement. Consumers join
 /// with `ss_credentials` / `wg_peers` separately via the per-protocol
 /// repos when they need the encrypted key material.
@@ -67,12 +106,13 @@ pub struct UserRow {
     pub wg_enabled: bool,
     pub proxy_enabled: bool,
     pub note: Option<String>,
+    pub source: UserSource,
 }
 
-type UserTuple = (String, String, i64, i64, i64, i64, Option<String>);
+type UserTuple = (String, String, i64, i64, i64, i64, Option<String>, String);
 
 fn user_row_from_tuple(t: UserTuple) -> UserRow {
-    let (id, name, created_at, ss_enabled, wg_enabled, proxy_enabled, note) = t;
+    let (id, name, created_at, ss_enabled, wg_enabled, proxy_enabled, note, source) = t;
     UserRow {
         id,
         name,
@@ -81,6 +121,10 @@ fn user_row_from_tuple(t: UserTuple) -> UserRow {
         wg_enabled: wg_enabled != 0,
         proxy_enabled: proxy_enabled != 0,
         note,
+        // Unknown tags shouldn't exist in production, but if they do
+        // we treat them as Local to avoid the control reconciler
+        // accidentally adopting and deleting them.
+        source: UserSource::from_tag(&source).unwrap_or(UserSource::Local),
     }
 }
 
@@ -88,7 +132,7 @@ fn is_unique_violation(err: &sqlx::Error) -> bool {
     match err {
         sqlx::Error::Database(db_err) => {
             let code = db_err.code();
-            matches!(code.as_deref(), Some("2067") | Some("1555") | Some("23000"))
+            matches!(code.as_deref(), Some("2067" | "1555" | "23000"))
         }
         _ => false,
     }
@@ -106,19 +150,34 @@ impl<'a> UsersRepo<'a> {
         Ok(n)
     }
 
-    /// Insert a naked user (all protocol flags 0). Returns
+    /// Insert a naked Local user (all protocol flags 0). Returns
     /// `Err(DbError::Invalid)` when `name` conflicts with an existing
-    /// row.
+    /// row. Convenience wrapper for the admin API path.
     pub async fn create(&self, id: &str, name: &str, note: Option<&str>) -> crate::Result<()> {
+        self.create_with_source(id, name, UserSource::Local, note)
+            .await
+    }
+
+    /// Insert a naked user with an explicit source tag. The control
+    /// reconciler uses this with `UserSource::Control`; the admin API
+    /// uses [`Self::create`] (Local).
+    pub async fn create_with_source(
+        &self,
+        id: &str,
+        name: &str,
+        source: UserSource,
+        note: Option<&str>,
+    ) -> crate::Result<()> {
         let now = chrono::Utc::now().timestamp();
         sqlx::query(
-            "INSERT INTO users(id, name, created_at, ss_enabled, wg_enabled, proxy_enabled, note)
-             VALUES (?, ?, ?, 0, 0, 0, ?)",
+            "INSERT INTO users(id, name, created_at, ss_enabled, wg_enabled, proxy_enabled, note, source)
+             VALUES (?, ?, ?, 0, 0, 0, ?, ?)",
         )
         .bind(id)
         .bind(name)
         .bind(now)
         .bind(note)
+        .bind(source.as_tag())
         .execute(self.pool)
         .await
         .map_err(|e| {
@@ -134,7 +193,7 @@ impl<'a> UsersRepo<'a> {
     /// Fetch a single user row by id.
     pub async fn get(&self, id: &str) -> crate::Result<Option<UserRow>> {
         let row: Option<UserTuple> = sqlx::query_as(
-            "SELECT id, name, created_at, ss_enabled, wg_enabled, proxy_enabled, note
+            "SELECT id, name, created_at, ss_enabled, wg_enabled, proxy_enabled, note, source
                FROM users WHERE id = ?",
         )
         .bind(id)
@@ -143,15 +202,29 @@ impl<'a> UsersRepo<'a> {
         Ok(row.map(user_row_from_tuple))
     }
 
-    /// List every user in creation order.
-    pub async fn list(&self) -> crate::Result<Vec<UserRow>> {
-        let rows: Vec<UserTuple> = sqlx::query_as(
-            "SELECT id, name, created_at, ss_enabled, wg_enabled, proxy_enabled, note
-               FROM users
-              ORDER BY created_at ASC, id ASC",
-        )
-        .fetch_all(self.pool)
-        .await?;
+    /// List every user in creation order, optionally restricted to
+    /// rows owned by a single source. The control reconciler scans
+    /// only its own slice when computing the prune set.
+    pub async fn list(&self, source: Option<UserSource>) -> crate::Result<Vec<UserRow>> {
+        let rows: Vec<UserTuple> = if let Some(s) = source {
+            sqlx::query_as(
+                "SELECT id, name, created_at, ss_enabled, wg_enabled, proxy_enabled, note, source
+                   FROM users
+                  WHERE source = ?
+                  ORDER BY created_at ASC, id ASC",
+            )
+            .bind(s.as_tag())
+            .fetch_all(self.pool)
+            .await?
+        } else {
+            sqlx::query_as(
+                "SELECT id, name, created_at, ss_enabled, wg_enabled, proxy_enabled, note, source
+                   FROM users
+                  ORDER BY created_at ASC, id ASC",
+            )
+            .fetch_all(self.pool)
+            .await?
+        };
         Ok(rows.into_iter().map(user_row_from_tuple).collect())
     }
 
@@ -279,7 +352,10 @@ impl<'a> SsRepo<'a> {
     }
 
     /// Create a user with an SS credential in a single transaction. Returns
-    /// `Err(DbError::Invalid)` if `name` already exists.
+    /// `Err(DbError::Invalid)` if `name` already exists. The user is
+    /// inserted with `source = local` because the only callers are
+    /// admin-driven (the API never creates SS users from the control
+    /// reconciler — control just toggles `ss_enabled` on existing rows).
     pub async fn create_user(
         &self,
         id: &str,
@@ -290,8 +366,8 @@ impl<'a> SsRepo<'a> {
         let now = chrono::Utc::now().timestamp();
         let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO users(id, name, created_at, ss_enabled, wg_enabled, proxy_enabled, note)
-             VALUES (?, ?, ?, 1, 0, 0, ?)",
+            "INSERT INTO users(id, name, created_at, ss_enabled, wg_enabled, proxy_enabled, note, source)
+             VALUES (?, ?, ?, 1, 0, 0, ?, 'local')",
         )
         .bind(id)
         .bind(name)
@@ -509,6 +585,27 @@ impl<'a> WgRepo<'a> {
               WHERE id = ?",
         )
         .bind(id)
+        .fetch_optional(self.pool)
+        .await?;
+
+        row.map(row_into_peer).transpose()
+    }
+
+    /// Load a peer by its WireGuard public key. Used by the userspace
+    /// backend's lazy-peer flow to resolve the sender of an inbound
+    /// handshake init.
+    pub async fn find_by_public_key(
+        &self,
+        public_key: &[u8; 32],
+    ) -> crate::Result<Option<WgPeerRow>> {
+        let row = sqlx::query_as::<_, WgPeerTuple>(
+            "SELECT id, user_id, name, public_key,
+                    preshared_key_enc, allowed_ip, endpoint, keepalive,
+                    created_at, updated_at
+               FROM wg_peers
+              WHERE public_key = ?",
+        )
+        .bind(public_key.as_slice())
         .fetch_optional(self.pool)
         .await?;
 

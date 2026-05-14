@@ -3,12 +3,16 @@
 use serde::{Deserialize, Serialize};
 
 /// Origin of a stored rule. `User` is writable through the API; every other
-/// source is read-only and owned by an internal driver.
+/// source is read-only and owned by an internal driver. `Control` is
+/// reserved for the reverse-API control center poller — its rules are
+/// declared by the remote control plane and are not editable through
+/// the local API.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Source {
     User,
     WgDriver,
+    Control,
 }
 
 impl Source {
@@ -16,6 +20,7 @@ impl Source {
         match self {
             Self::User => "user",
             Self::WgDriver => "wg-driver",
+            Self::Control => "control",
         }
     }
 
@@ -23,6 +28,7 @@ impl Source {
         match tag {
             "user" => Some(Self::User),
             "wg-driver" => Some(Self::WgDriver),
+            "control" => Some(Self::Control),
             _ => None,
         }
     }

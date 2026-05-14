@@ -42,6 +42,14 @@ pub trait IptablesManager: Send + Sync {
     /// the API's DELETE handler.
     async fn remove_user_rule(&self, id: &str) -> Result<()>;
 
+    /// Remove one rule by id, but only when its owning source is
+    /// `Control`. Used by the control-center poller's declarative
+    /// reconciler when a previously-installed rule is no longer in
+    /// the snapshot. Returns `Forbidden` when the rule is owned by a
+    /// different source so a malformed snapshot can never reach into
+    /// `User` / `WgDriver` rules.
+    async fn remove_control_rule(&self, id: &str) -> Result<()>;
+
     /// Enumerate persisted rules.
     async fn list(&self, filter: ListFilter) -> Result<Vec<StoredRule>>;
 
@@ -115,6 +123,32 @@ impl DefaultManager {
         let tag = row.comment_tag();
         let full = Self::tokens_with_comment(spec_tokens, &tag);
         self.backend.append(&row.table, &row.chain, &full).await
+    }
+
+    /// Shared implementation of the per-id deletion guarded by
+    /// `expected_source`. Returns `Forbidden` when the row exists but
+    /// is owned by another source, so handlers can never accidentally
+    /// reach across source boundaries.
+    async fn remove_one_by_id(&self, id: &str, expected_source: Source) -> Result<()> {
+        let row = self
+            .repo()
+            .get(id)
+            .await?
+            .ok_or_else(|| NetctlError::NotFound(id.to_owned()))?;
+        let stored = row_to_stored(row)?;
+        if stored.source != expected_source {
+            return Err(NetctlError::Forbidden(format!(
+                "rule {} is owned by {} and cannot be deleted as {}",
+                stored.id,
+                stored.source.as_tag(),
+                expected_source.as_tag()
+            )));
+        }
+        self.uninstall_rule(&stored).await?;
+        if !self.repo().delete(&stored.id).await? {
+            return Err(NetctlError::NotFound(stored.id));
+        }
+        Ok(())
     }
 
     async fn uninstall_rule(&self, row: &StoredRule) -> Result<()> {
@@ -192,24 +226,12 @@ impl IptablesManager for DefaultManager {
 
     #[tracing::instrument(skip(self))]
     async fn remove_user_rule(&self, id: &str) -> Result<()> {
-        let row = self
-            .repo()
-            .get(id)
-            .await?
-            .ok_or_else(|| NetctlError::NotFound(id.to_owned()))?;
-        let stored = row_to_stored(row)?;
-        if stored.source != Source::User {
-            return Err(NetctlError::Forbidden(format!(
-                "rule {} is owned by {} and cannot be deleted through the API",
-                stored.id,
-                stored.source.as_tag()
-            )));
-        }
-        self.uninstall_rule(&stored).await?;
-        if !self.repo().delete(&stored.id).await? {
-            return Err(NetctlError::NotFound(stored.id));
-        }
-        Ok(())
+        self.remove_one_by_id(id, Source::User).await
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn remove_control_rule(&self, id: &str) -> Result<()> {
+        self.remove_one_by_id(id, Source::Control).await
     }
 
     async fn list(&self, filter: ListFilter) -> Result<Vec<StoredRule>> {

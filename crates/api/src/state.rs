@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use nsp_core::config::ApiMode;
 use nsp_core::crypto::{JwtKey, MasterKey};
 use nsp_core::ReconcilerHandle;
 use nsp_db::Pool;
@@ -33,6 +34,9 @@ pub struct AppState {
     /// successful DB update so the convergence loop runs without waiting
     /// for the periodic tick. `None` during tests or bootstrap.
     pub reconciler: Option<ReconcilerHandle>,
+    /// Lockdown stance for the `/api/*` surface. Applied at the
+    /// router level via the `enforce_api_mode` middleware.
+    pub api_mode: ApiMode,
 }
 
 impl AppState {
@@ -54,7 +58,13 @@ impl AppState {
             proxy: None,
             iptables: None,
             reconciler: None,
+            api_mode: ApiMode::default(),
         }
+    }
+
+    pub fn with_api_mode(mut self, mode: ApiMode) -> Self {
+        self.api_mode = mode;
+        self
     }
 
     pub fn with_ss_driver(mut self, ss: SsDriver) -> Self {

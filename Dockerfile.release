@@ -15,9 +15,20 @@
 
 ARG RUST_IMAGE=rust:1.90-alpine3.20
 ARG RUNTIME_IMAGE=alpine:3.20
+ARG BUN_IMAGE=oven/bun:1.2-alpine
 
 # --------------------------------------------------------------------------
-# Build stage.
+# UI build stage — produces ui/dist consumed by the rust build.
+# --------------------------------------------------------------------------
+FROM ${BUN_IMAGE} AS ui-build
+WORKDIR /ui
+COPY ui/package.json ui/bun.lock ./
+RUN bun install --frozen-lockfile
+COPY ui ./
+RUN bun run build
+
+# --------------------------------------------------------------------------
+# Rust build stage.
 # --------------------------------------------------------------------------
 FROM ${RUST_IMAGE} AS build
 RUN apk add --no-cache musl-dev pkgconfig perl make bash sqlite-static
@@ -27,7 +38,7 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY .cargo ./.cargo
 COPY crates ./crates
 COPY migrations ./migrations
-COPY ui/dist ./ui/dist
+COPY --from=ui-build /ui/dist ./ui/dist
 
 ENV CARGO_TERM_COLOR=always \
     RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-s"
@@ -45,7 +56,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # Runtime stage — minimal alpine, non-root.
 # --------------------------------------------------------------------------
 FROM ${RUNTIME_IMAGE} AS runtime
-RUN apk add --no-cache iproute2 ca-certificates tini \
+RUN apk add --no-cache iproute2 iptables ca-certificates tini \
  && addgroup -S nsp \
  && adduser -S -G nsp -H -D nsp \
  && mkdir -p /work/data /work/acme /work/backups /etc/nsp \

@@ -1,0 +1,12 @@
+# Bun runtime + test config for the nsp e2e suite.
+#
+# `concurrent = false` keeps test files serialised — phases share
+# state (alice/bob ids, server pubkey) via module-level `ctx`, and
+# parallel files would race the API.
+#
+# Per-test timeout is set with `--timeout` on the command line (see
+# the Dockerfile / docker-compose.yml CMD). bunfig has no
+# `[test].timeout` key as of 1.3.x; setting it here would silently be
+# ignored.
+[test]
+concurrent = false

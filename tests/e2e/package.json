@@ -1,0 +1,21 @@
+{
+  "name": "nsp-e2e",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.3.12",
+  "description": "nsp end-to-end test suite. Drives the API + kernel WG data plane from inside the tester container.",
+  "scripts": {
+    "test": "bun test",
+    "e2e": "bun run src/runner.ts",
+    "e2e:control": "E2E_MODE=control bun run src/runner.ts",
+    "e2e:control:keep": "E2E_MODE=control-keep bun run src/runner.ts",
+    "e2e:control:prune": "E2E_MODE=control-prune bun run src/runner.ts",
+    "e2e:all": "E2E_MODE=all bun run src/runner.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.0",
+    "typescript": "^5.7.0"
+  }
+}

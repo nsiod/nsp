@@ -104,3 +104,28 @@ export interface AuthLogin {
 export interface Me {
   sub: string;
 }
+
+export interface ProxyStatus {
+  running: boolean;
+  available: boolean;
+  socks5_port: number;
+  http_port: number;
+  public_host: string;
+  users: number;
+  reload_count: number;
+  reason?: string | null;
+}
+
+export interface ProxyEnableResponse {
+  user_id: string;
+  name: string;
+  username: string;
+  password: string;
+  socks5_url: string;
+  http_url: string;
+  pending: boolean;
+}
+
+export interface ProxyDisableAck {
+  pending: boolean;
+}

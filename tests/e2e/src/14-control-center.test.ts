@@ -121,7 +121,7 @@ afterAll(async () => {
 // than red, so a default `bun run e2e` exits 0 even though the file
 // exists.
 describe.skipIf(!CONTROL_ACTIVE)(
-  `phase 13 — reverse-API control center [policy=${POLICY}]`,
+  `phase 14 — reverse-API control center [policy=${POLICY}]`,
   () => {
   test("baseline: /config + /status are being polled", async () => {
     // The poller fires every 2s. Within a few seconds the mock

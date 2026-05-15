@@ -14,7 +14,11 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 
 import type { Client } from "./lib/client.ts";
-import { proxyRunningIs } from "./lib/predicates.ts";
+import {
+  proxyRunningIs,
+  proxyUsersAtLeast,
+  proxyUsersIs,
+} from "./lib/predicates.ts";
 import { bootstrapClient, uniqueSuffix } from "./lib/setup.ts";
 import type {
   DisableAck,
@@ -83,11 +87,12 @@ describe("phase 13 — SOCKS5 + HTTP CONNECT proxy", () => {
   });
 
   test("GET /api/protocol/proxy/status — user count increments", async () => {
-    const s = await client.ok<ProxyStatus>(
-      "GET",
-      "/api/protocol/proxy/status",
-    );
-    expect(s.users).toBeGreaterThanOrEqual(1);
+    // The driver refreshes the in-memory user count through the
+    // reconciler (notify + 500ms debounce), so the status snapshot
+    // lags the DB write briefly. Poll instead of asserting once.
+    await waitUntil(5_000, proxyUsersAtLeast(client, 1), {
+      label: "proxy.users>=1",
+    });
   });
 
   test("POST /api/users/:id/proxy/rotate — fresh password", async () => {
@@ -124,10 +129,8 @@ describe("phase 13 — SOCKS5 + HTTP CONNECT proxy", () => {
   });
 
   test("GET /api/protocol/proxy/status — user count back to baseline", async () => {
-    const s = await client.ok<ProxyStatus>(
-      "GET",
-      "/api/protocol/proxy/status",
-    );
-    expect(s.users).toBe(0);
+    await waitUntil(5_000, proxyUsersIs(client, 0), {
+      label: "proxy.users=0",
+    });
   });
 });

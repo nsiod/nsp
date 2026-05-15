@@ -36,3 +36,23 @@ export function proxyRunningIs(client: Client, want: boolean) {
     return s.running === want;
   };
 }
+
+export function proxyUsersIs(client: Client, want: number) {
+  return async (): Promise<boolean> => {
+    const s = await client.ok<ProxyStatus>(
+      "GET",
+      "/api/protocol/proxy/status",
+    );
+    return s.users === want;
+  };
+}
+
+export function proxyUsersAtLeast(client: Client, want: number) {
+  return async (): Promise<boolean> => {
+    const s = await client.ok<ProxyStatus>(
+      "GET",
+      "/api/protocol/proxy/status",
+    );
+    return s.users >= want;
+  };
+}

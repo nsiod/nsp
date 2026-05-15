@@ -1154,7 +1154,7 @@ async fn run_config_once(
             return;
         }
     };
-    let stats = &mut outcome.stats;
+    let rec_stats = &mut outcome.stats;
 
     // `reset` clears the persisted cursor BEFORE we write the fresh
     // one, so a payload carrying `reset:true` + `cursor:"vN"` overwrites
@@ -1164,7 +1164,7 @@ async fn run_config_once(
         if let Err(err) = clear_cursor(pool).await {
             tracing::warn!(%err, "control: clear cursor failed");
         } else {
-            stats.cursor_reset = true;
+            rec_stats.cursor_reset = true;
         }
     }
     if let Some(cursor) = snap.cursor.as_deref() {
@@ -1173,30 +1173,30 @@ async fn run_config_once(
         }
     }
 
-    if stats.touched_users() || stats.touched_iptables() || stats.settings_changed {
+    if rec_stats.touched_users() || rec_stats.touched_iptables() || rec_stats.settings_changed {
         tracing::info!(
-            mode = stats.mode.map(ReconcileMode::as_str).unwrap_or("none"),
+            mode = rec_stats.mode.map(ReconcileMode::as_str).unwrap_or("none"),
             snapshot_mode = snap.mode.as_str(),
-            cursor_reset = stats.cursor_reset,
-            created = stats.users_created,
-            updated = stats.users_updated,
-            deleted = stats.users_deleted,
-            skipped_local = stats.users_skipped_local,
-            ipt_added = stats.iptables_added,
-            ipt_removed = stats.iptables_removed,
-            ipt_kept = stats.iptables_kept,
-            settings_changed = stats.settings_changed,
+            cursor_reset = rec_stats.cursor_reset,
+            created = rec_stats.users_created,
+            updated = rec_stats.users_updated,
+            deleted = rec_stats.users_deleted,
+            skipped_local = rec_stats.users_skipped_local,
+            ipt_added = rec_stats.iptables_added,
+            ipt_removed = rec_stats.iptables_removed,
+            ipt_kept = rec_stats.iptables_kept,
+            settings_changed = rec_stats.settings_changed,
             issues = outcome.issues.len(),
             "control: reconcile applied"
         );
-        if stats.touched_users() {
+        if rec_stats.touched_users() {
             if let Some(r) = reconciler {
                 r.notify();
             }
         }
     } else {
         tracing::debug!(
-            mode = stats.mode.map(ReconcileMode::as_str).unwrap_or("none"),
+            mode = rec_stats.mode.map(ReconcileMode::as_str).unwrap_or("none"),
             issues = outcome.issues.len(),
             "control: snapshot matches local state"
         );
@@ -1209,7 +1209,7 @@ async fn run_config_once(
     // waiting on the next status tick.
     {
         let mut shared = shared.lock().await;
-        shared.last_apply = ApplyReport::from_stats(*stats);
+        shared.last_apply = ApplyReport::from_stats(*rec_stats);
     }
     if let Some(tx) = REPORTER.get() {
         for issue in outcome.issues {
@@ -1663,18 +1663,17 @@ async fn upsert_user(
             ));
         }
         Some(existing) => {
-            let mut changed = false;
-            if existing.name != incoming.name {
+            let name_changed = existing.name != incoming.name;
+            if name_changed {
                 users_repo.rename(&incoming.id, &incoming.name).await?;
-                changed = true;
             }
-            if existing.note != incoming.note {
+            let note_changed = existing.note != incoming.note;
+            if note_changed {
                 users_repo
                     .update_note(&incoming.id, incoming.note.as_deref())
                     .await?;
-                changed = true;
             }
-            if changed {
+            if name_changed || note_changed {
                 outcome.stats.users_updated += 1;
                 audit(
                     pool,

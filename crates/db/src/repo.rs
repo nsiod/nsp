@@ -234,7 +234,7 @@ impl<'a> UsersRepo<'a> {
     /// for callers that need to flip the flag without touching the
     /// credential blob.
     pub async fn set_proxy_enabled(&self, id: &str, enabled: bool) -> crate::Result<bool> {
-        let value: i64 = if enabled { 1 } else { 0 };
+        let value = i64::from(enabled);
         let result = sqlx::query("UPDATE users SET proxy_enabled = ? WHERE id = ?")
             .bind(value)
             .bind(id)

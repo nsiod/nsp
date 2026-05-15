@@ -184,7 +184,7 @@ pub(crate) struct DestinationPolicy {
 }
 
 impl DestinationPolicy {
-    pub(crate) fn blocks(&self, ip: std::net::IpAddr) -> bool {
+    pub(crate) fn blocks(self, ip: std::net::IpAddr) -> bool {
         if self.allow_loopback {
             return false;
         }
@@ -662,10 +662,10 @@ impl ProxyDriver {
         } else {
             let listen = self.inner.listen.read().await.clone();
             let socks5 = probe_port_bindable(listen.bind, listen.socks5_port, "socks5");
-            if !socks5.available {
-                socks5
-            } else {
+            if socks5.available {
                 probe_port_bindable(listen.bind, listen.http_port, "http")
+            } else {
+                socks5
             }
         };
         *self.inner.availability_cache.write().await = Some((Instant::now(), fresh.clone()));

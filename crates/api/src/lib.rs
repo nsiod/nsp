@@ -19,6 +19,7 @@ use nsp_core::config::ApiMode;
 pub mod audit;
 pub mod error;
 pub mod iptables;
+pub mod proxy;
 pub mod routes;
 pub mod settings;
 pub mod spa;
@@ -51,6 +52,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(settings::protected_router(state.clone()))
         .nest("/api/protocol/ss", ss::protected_router(state.clone()))
         .nest("/api/protocol/wg", wg::protected_router(state.clone()))
+        .nest(
+            "/api/protocol/proxy",
+            proxy::protected_router(state.clone()),
+        )
         .nest("/api/users", users::protected_router(state.clone()))
         .nest("/api/iptables", iptables::protected_router(state.clone()))
         .layer(from_fn_with_state(state.clone(), enforce_api_mode));
@@ -101,6 +106,7 @@ mod tests {
         http::{header, Method, Request, StatusCode},
     };
     use nsp_core::{auth, crypto::MasterKey};
+    use nsp_proxy_driver::{ProxyDriver, ProxyDriverConfig};
     use nsp_ss_driver::{SsDriver, SsDriverConfig};
     use nsp_wg_driver::{BackendKind, WgConfig, WgDriver};
     use secrecy::SecretString;
@@ -179,8 +185,18 @@ mod tests {
             "127.0.0.1".to_owned(),
             1,
         );
-        let ss = SsDriver::new(ss_cfg, db, master_key);
+        let ss = SsDriver::new(ss_cfg, db.clone(), master_key.clone());
         state = state.with_ss_driver(ss);
+        let mut proxy_cfg = ProxyDriverConfig::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            0,
+            0,
+            "127.0.0.1".to_owned(),
+            1,
+        );
+        proxy_cfg.allow_loopback_destinations = true;
+        let proxy = ProxyDriver::new(proxy_cfg, db, master_key);
+        state = state.with_proxy(proxy);
         Arc::new(state)
     }
 
@@ -940,6 +956,181 @@ mod tests {
             original_pub
         );
         assert!(rotated["secrets"]["private_key"].is_string());
+    }
+
+    // ---------------- proxy ----------------
+
+    #[tokio::test]
+    async fn proxy_status_reports_unavailable_when_disabled() {
+        // test_state without proxy driver — the route returns 200 with
+        // `available: false`, mirroring the SS / WG behaviour from
+        // commit 73e6516.
+        let state = test_state(false).await;
+        let tok = token(&state);
+        let response = send(
+            state,
+            Method::GET,
+            "/api/protocol/proxy/status",
+            Some(&tok),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["running"], false);
+        assert_eq!(body["available"], false);
+        assert!(body["reason"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn proxy_routes_require_jwt() {
+        let state = test_state_full().await;
+        let cases = [
+            (Method::GET, "/api/protocol/proxy/status"),
+            (Method::POST, "/api/protocol/proxy/start"),
+            (Method::POST, "/api/protocol/proxy/stop"),
+            (Method::GET, "/api/users/nope/proxy"),
+            (Method::POST, "/api/users/nope/proxy"),
+            (Method::DELETE, "/api/users/nope/proxy"),
+            (Method::POST, "/api/users/nope/proxy/rotate"),
+        ];
+        for (method, uri) in cases {
+            let response = send(state.clone(), method, uri, None, None).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn users_enable_proxy_when_driver_stopped_is_pending() {
+        let state = test_state_full().await;
+        let tok = token(&state);
+        let id = create_user_helper(state.clone(), &tok, "ivan").await;
+
+        let response = send(
+            state.clone(),
+            Method::POST,
+            &format!("/api/users/{id}/proxy"),
+            Some(&tok),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let v = body_json(response).await;
+        assert_eq!(v["pending"], true);
+        assert_eq!(v["user_id"], id);
+        assert!(!v["username"].as_str().unwrap_or_default().is_empty());
+        assert!(!v["password"].as_str().unwrap_or_default().is_empty());
+        assert!(v["socks5_url"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("socks5://"));
+        assert!(v["http_url"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("http://"));
+
+        // users.proxy_enabled must flip true.
+        let response = send(
+            state.clone(),
+            Method::GET,
+            &format!("/api/users/{id}"),
+            Some(&tok),
+            None,
+        )
+        .await;
+        let v = body_json(response).await;
+        assert_eq!(v["proxy_enabled"], true);
+
+        // Disable removes the credential row.
+        let response = send(
+            state.clone(),
+            Method::DELETE,
+            &format!("/api/users/{id}/proxy"),
+            Some(&tok),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let v = body_json(response).await;
+        assert_eq!(v["pending"], true);
+
+        let response = send(
+            state,
+            Method::GET,
+            &format!("/api/users/{id}"),
+            Some(&tok),
+            None,
+        )
+        .await;
+        let v = body_json(response).await;
+        assert_eq!(v["proxy_enabled"], false);
+    }
+
+    #[tokio::test]
+    async fn users_proxy_rotate_returns_new_password() {
+        let state = test_state_full().await;
+        let tok = token(&state);
+        let id = create_user_helper(state.clone(), &tok, "jamal").await;
+        let response = send(
+            state.clone(),
+            Method::POST,
+            &format!("/api/users/{id}/proxy"),
+            Some(&tok),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let v = body_json(response).await;
+        let first_pw = v["password"].as_str().unwrap().to_owned();
+        let first_user = v["username"].as_str().unwrap().to_owned();
+
+        let response = send(
+            state.clone(),
+            Method::POST,
+            &format!("/api/users/{id}/proxy/rotate"),
+            Some(&tok),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let v = body_json(response).await;
+        let new_pw = v["password"].as_str().unwrap().to_owned();
+        let new_user = v["username"].as_str().unwrap().to_owned();
+        assert_ne!(new_pw, first_pw, "rotate must change the password");
+        // Username is stable across rotation so existing client config
+        // templates that quote it keep working.
+        assert_eq!(new_user, first_user);
+    }
+
+    #[tokio::test]
+    async fn users_proxy_detail_excludes_password() {
+        let state = test_state_full().await;
+        let tok = token(&state);
+        let id = create_user_helper(state.clone(), &tok, "kim").await;
+        let response = send(
+            state.clone(),
+            Method::POST,
+            &format!("/api/users/{id}/proxy"),
+            Some(&tok),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let response = send(
+            state,
+            Method::GET,
+            &format!("/api/users/{id}/proxy"),
+            Some(&tok),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let v = body_json(response).await;
+        assert!(!v["username"].as_str().unwrap().is_empty());
+        assert!(v.get("password").is_none());
+        // URLs include the username but not the password.
+        assert!(v["socks5_url"].as_str().unwrap().contains("socks5://"));
     }
 
     #[tokio::test]

@@ -217,8 +217,8 @@ impl WgDriver {
     pub fn new(cfg: WgConfig, db: Pool, master_key: Arc<MasterKey>) -> Self {
         let resolver: Arc<dyn PeerResolver> =
             Arc::new(DbPeerResolver::new(db.clone(), Arc::clone(&master_key)));
-        let (backend, resolved) = backend::build(cfg.backend, Some(resolver));
-        Self::with_backend(cfg, db, master_key, backend, resolved)
+        let (backend, picked) = backend::build(cfg.backend, Some(resolver));
+        Self::with_backend(cfg, db, master_key, backend, picked)
     }
 
     /// Construct with an explicit backend instance. Mostly useful in tests

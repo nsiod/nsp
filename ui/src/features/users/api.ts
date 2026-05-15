@@ -8,6 +8,8 @@ import type {
   UserCreateRequest,
   UserEntry,
   UserProtocolAck,
+  UserProxyDetail,
+  UserProxyEnabled,
   UserSsDetail,
   UserSsEnabled,
   UserUpdateRequest,
@@ -188,6 +190,67 @@ export function useRotateUserWgMutation() {
       }),
     onSuccess: (_data, { id }) => {
       qc.invalidateQueries({ queryKey: queryKeys.userWg(id) });
+    },
+  });
+}
+
+// ---- per-user proxy ----
+
+export function useUserProxyDetailQuery(
+  id: string,
+  opts?: Partial<UseQueryOptions<UserProxyDetail, ApiError>>,
+) {
+  return useQuery<UserProxyDetail, ApiError>({
+    queryKey: queryKeys.userProxy(id),
+    queryFn: () => apiRequest<UserProxyDetail>(`/api/users/${encodeURIComponent(id)}/proxy`),
+    enabled: !!id,
+    ...opts,
+  });
+}
+
+export function useEnableUserProxyMutation() {
+  const qc = useQueryClient();
+  return useMutation<UserProxyEnabled, ApiError, string>({
+    mutationFn: (id) =>
+      apiRequest<UserProxyEnabled>(`/api/users/${encodeURIComponent(id)}/proxy`, {
+        method: 'POST',
+      }),
+    onSuccess: (_data, id) => {
+      qc.invalidateQueries({ queryKey: queryKeys.users });
+      qc.invalidateQueries({ queryKey: queryKeys.user(id) });
+      qc.invalidateQueries({ queryKey: queryKeys.userProxy(id) });
+      qc.invalidateQueries({ queryKey: queryKeys.proxyStatus });
+      qc.invalidateQueries({ queryKey: queryKeys.status });
+    },
+  });
+}
+
+export function useDisableUserProxyMutation() {
+  const qc = useQueryClient();
+  return useMutation<UserProtocolAck, ApiError, string>({
+    mutationFn: (id) =>
+      apiRequest<UserProtocolAck>(`/api/users/${encodeURIComponent(id)}/proxy`, {
+        method: 'DELETE',
+      }),
+    onSuccess: (_data, id) => {
+      qc.invalidateQueries({ queryKey: queryKeys.users });
+      qc.invalidateQueries({ queryKey: queryKeys.user(id) });
+      qc.invalidateQueries({ queryKey: queryKeys.userProxy(id) });
+      qc.invalidateQueries({ queryKey: queryKeys.proxyStatus });
+      qc.invalidateQueries({ queryKey: queryKeys.status });
+    },
+  });
+}
+
+export function useRotateUserProxyMutation() {
+  const qc = useQueryClient();
+  return useMutation<UserProxyEnabled, ApiError, string>({
+    mutationFn: (id) =>
+      apiRequest<UserProxyEnabled>(`/api/users/${encodeURIComponent(id)}/proxy/rotate`, {
+        method: 'POST',
+      }),
+    onSuccess: (_data, id) => {
+      qc.invalidateQueries({ queryKey: queryKeys.userProxy(id) });
     },
   });
 }

@@ -167,18 +167,27 @@ jobs:
           provenance: false
           sbom: false
           tags: nsp:ci
-      - name: verify image size under 30 MB
+      - name: verify image size under 36 MB
         run: |
           set -euo pipefail
           # Sum of all non-attestation layer sizes reported by `docker history`.
           # This matches what a runtime actually needs to fetch/unpack, unlike
           # the virtual size in `docker images` which can double-count.
+          #
+          # Budget recalibrated 30 -> 36 MB: the original 30 MB ceiling
+          # predates three feature additions that legitimately grow the
+          # static binary — FEAT-012 (SOCKS5 + HTTP CONNECT proxy crate),
+          # the kernel-netlink WireGuard backend, and the reverse-API
+          # control center. The release profile is already at the size
+          # floor (thin-LTO, codegen-units=1, strip, panic=abort, musl,
+          # double strip). 36 MB keeps a real guardrail with modest
+          # headroom rather than a blank cheque.
           bytes=$(docker history --format '{{.Size}}' --human=false nsp:ci \
                     | awk '{s+=$1} END {print s}')
-          limit=$((30 * 1024 * 1024))
+          limit=$((36 * 1024 * 1024))
           echo "image layer sum: $bytes bytes (limit $limit)"
           if [ "$bytes" -gt "$limit" ]; then
-            echo "release image exceeds 30 MB budget"
+            echo "release image exceeds 36 MB budget"
             exit 1
           fi
       - name: smoke-start container

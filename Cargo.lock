@@ -2408,6 +2408,7 @@ dependencies = [
  "nsp-core",
  "nsp-db",
  "nsp-netctl",
+ "nsp-proxy-driver",
  "nsp-ss-driver",
  "nsp-wg-driver",
  "rcgen",
@@ -2446,6 +2447,7 @@ dependencies = [
  "nsp-core",
  "nsp-db",
  "nsp-netctl",
+ "nsp-proxy-driver",
  "nsp-ss-driver",
  "nsp-wg-driver",
  "rust-embed",
@@ -2514,6 +2516,27 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "nsp-proxy-driver"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "chrono",
+ "nsp-core",
+ "nsp-db",
+ "rand 0.8.6",
+ "serde",
+ "sqlx",
+ "subtle",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]

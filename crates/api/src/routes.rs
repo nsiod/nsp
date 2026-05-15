@@ -43,12 +43,13 @@ struct StatusResponse {
     version: &'static str,
     ss_enabled: bool,
     wg_enabled: bool,
+    proxy_enabled: bool,
 }
 
 async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
     // `enabled` reports the live running state, not config intent: once the
-    // API has driven a driver up or down via /api/{ss,wg}/{start,stop}, the
-    // config `enabled` flag is no longer the source of truth.
+    // API has driven a driver up or down via /api/{ss,wg,proxy}/{start,stop},
+    // the config `enabled` flag is no longer the source of truth.
     let ss_enabled = if let Some(ss) = state.ss_driver.as_ref() {
         ss.is_running().await
     } else {
@@ -59,10 +60,16 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
     } else {
         false
     };
+    let proxy_enabled = if let Some(p) = state.proxy.as_ref() {
+        p.is_running().await
+    } else {
+        false
+    };
     Json(StatusResponse {
         version: state.version,
         ss_enabled,
         wg_enabled,
+        proxy_enabled,
     })
 }
 

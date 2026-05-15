@@ -1,0 +1,40 @@
+[package]
+name = "nsp-proxy-driver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "nsp_proxy_driver"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Opt-in live end-to-end tests: binds real TCP ports and speaks SOCKS5 /
+# HTTP CONNECT to a loopback echo server. Off by default so `cargo test`
+# stays hermetic.
+live-e2e = []
+
+[dependencies]
+nsp-core = { path = "../core" }
+nsp-db = { path = "../db" }
+
+async-trait = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+sqlx = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3"
+uuid = { workspace = true }

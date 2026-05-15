@@ -1,16 +1,18 @@
 import type { FormEvent } from 'react';
 import type { SecretBlock } from '@/features/users/components/secret-reveal';
-import type { UserEntry, UserSsEnabled, UserWgEnabled } from '@/shared/types';
+import type { UserEntry, UserProxyEnabled, UserSsEnabled, UserWgEnabled } from '@/shared/types';
 import { Link } from '@tanstack/react-router';
 import { ChevronLeft, ChevronRight, KeyRound, Plus, Search, Trash2 } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useSsStatusQuery, useWgStatusQuery } from '@/features/services/api';
+import { useProxyStatusQuery, useSsStatusQuery, useWgStatusQuery } from '@/features/services/api';
 import {
   useCreateUserMutation,
   useDeleteUserMutation,
+  useDisableUserProxyMutation,
   useDisableUserSsMutation,
   useDisableUserWgMutation,
+  useEnableUserProxyMutation,
   useEnableUserSsMutation,
   useEnableUserWgMutation,
   useUsersQuery,
@@ -48,6 +50,7 @@ export function UsersPage() {
   const users = useUsersQuery();
   const ssStatus = useSsStatusQuery();
   const wgStatus = useWgStatusQuery();
+  const proxyStatus = useProxyStatusQuery();
   const [search, setSearch] = useState('');
   const [page, setPage] = useState(0);
   const [createOpen, setCreateOpen] = useState(false);
@@ -57,6 +60,8 @@ export function UsersPage() {
   const disableSs = useDisableUserSsMutation();
   const enableWg = useEnableUserWgMutation();
   const disableWg = useDisableUserWgMutation();
+  const enableProxy = useEnableUserProxyMutation();
+  const disableProxy = useDisableUserProxyMutation();
   const deleteUser = useDeleteUserMutation();
 
   // Two flavours of "unavailable" — see user-detail-page.tsx for the
@@ -68,8 +73,18 @@ export function UsersPage() {
   const ssPaused = !ssAbsent && ssStatus.data?.available === false;
   const wgAbsent = wgStatus.error?.isUnavailable() ?? false;
   const wgPaused = !wgAbsent && wgStatus.data?.available === false;
+  // The proxy status route never 503s (it returns 200 with
+  // `available:false` when the driver is absent), so treat the
+  // "disabled in configuration" reason as the absent signal and any
+  // other `available:false` as paused.
+  const proxyAvailableFlag = proxyStatus.data?.available ?? true;
+  const proxyConfigDisabled = !proxyAvailableFlag
+    && proxyStatus.data?.reason?.toLowerCase().includes('disabled in configuration');
+  const proxyAbsent = (proxyStatus.error?.isUnavailable() ?? false) || !!proxyConfigDisabled;
+  const proxyPaused = !proxyAbsent && !proxyAvailableFlag;
   const ssDriverDown = ssAbsent;
   const wgDriverDown = wgAbsent;
+  const proxyDriverDown = proxyAbsent;
 
   const rows = useMemo<UserEntry[]>(() => {
     return [...(users.data ?? [])].sort((a, b) => a.name.localeCompare(b.name));
@@ -117,6 +132,20 @@ export function UsersPage() {
     }
   };
 
+  const handleToggleProxy = (row: UserEntry, next: boolean) => {
+    if (next && !row.proxy_enabled) {
+      enableProxy.mutate(row.id, {
+        onSuccess: (m) => showProxyCreated(m),
+        onError: (err) => toaster.error(t('users.toasts.enableProxyFailed'), err.message),
+      });
+    }
+    else if (!next && row.proxy_enabled) {
+      disableProxy.mutate(row.id, {
+        onError: (err) => toaster.error(t('users.toasts.disableProxyFailed'), err.message),
+      });
+    }
+  };
+
   const handleDelete = (row: UserEntry) => {
     if (!window.confirm(t('users.confirmRemove', { name: row.name })))
       return;
@@ -145,6 +174,36 @@ export function UsersPage() {
           label: t('users.reveal.serverPskLabel'),
           value: m.server_psk,
           filename: `${slug(m.name)}.server-psk.txt`,
+          advanced: true,
+        },
+      ],
+    });
+  };
+
+  const showProxyCreated = (m: UserProxyEnabled) => {
+    setReveal({
+      title: t('users.reveal.proxyTitle', { name: m.name }),
+      blocks: [
+        {
+          label: t('users.reveal.socks5UrlLabel'),
+          value: m.socks5_url,
+          filename: `${slug(m.name)}.socks5.txt`,
+        },
+        {
+          label: t('users.reveal.httpUrlLabel'),
+          value: m.http_url,
+          filename: `${slug(m.name)}.http.txt`,
+        },
+        {
+          label: t('users.reveal.proxyUsernameLabel'),
+          value: m.username,
+          filename: `${slug(m.name)}.proxy-user.txt`,
+          advanced: true,
+        },
+        {
+          label: t('users.reveal.proxyPasswordLabel'),
+          value: m.password,
+          filename: `${slug(m.name)}.proxy-pass.txt`,
           advanced: true,
         },
       ],
@@ -219,6 +278,7 @@ export function UsersPage() {
               <TableHead>{t('users.table.name')}</TableHead>
               <TableHead>{t('users.table.ss')}</TableHead>
               <TableHead>{t('users.table.wg')}</TableHead>
+              <TableHead>{t('users.table.proxy')}</TableHead>
               <TableHead>{t('users.table.created')}</TableHead>
               <TableHead className="text-right">{t('users.table.actions')}</TableHead>
             </TableRow>
@@ -227,7 +287,7 @@ export function UsersPage() {
             {users.isLoading
               ? (
                   <TableRow>
-                    <TableCell colSpan={5} className="text-center text-muted-foreground">
+                    <TableCell colSpan={6} className="text-center text-muted-foreground">
                       {t('common.loading')}
                     </TableCell>
                   </TableRow>
@@ -235,7 +295,7 @@ export function UsersPage() {
               : visible.length === 0
                 ? (
                     <TableRow>
-                      <TableCell colSpan={5} className="text-center text-muted-foreground">
+                      <TableCell colSpan={6} className="text-center text-muted-foreground">
                         {search ? t('users.emptyFiltered') : t('users.empty')}
                       </TableCell>
                     </TableRow>
@@ -279,6 +339,19 @@ export function UsersPage() {
                             aria-label={t('users.toggleWgAria', { name: row.name })}
                           />
                         </TableCell>
+                        <TableCell>
+                          <Switch
+                            checked={row.proxy_enabled}
+                            disabled={
+                              proxyDriverDown
+                              || enableProxy.isPending
+                              || disableProxy.isPending
+                              || deleteUser.isPending
+                            }
+                            onCheckedChange={(c) => handleToggleProxy(row, c)}
+                            aria-label={t('users.toggleProxyAria', { name: row.name })}
+                          />
+                        </TableCell>
                         <TableCell className="text-xs text-muted-foreground">
                           {formatTimestamp(row.created_at)}
                         </TableCell>
@@ -311,11 +384,19 @@ export function UsersPage() {
         </Table>
       </div>
 
-      {(ssDriverDown || wgDriverDown) && (
-        <DriverWarning ssDown={ssDriverDown} wgDown={wgDriverDown} />
+      {(ssDriverDown || wgDriverDown || proxyDriverDown) && (
+        <DriverWarning
+          ssDown={ssDriverDown}
+          wgDown={wgDriverDown}
+          proxyDown={proxyDriverDown}
+        />
       )}
-      {(ssPaused || wgPaused) && (
-        <DriverPausedHint ssPaused={ssPaused} wgPaused={wgPaused} />
+      {(ssPaused || wgPaused || proxyPaused) && (
+        <DriverPausedHint
+          ssPaused={ssPaused}
+          wgPaused={wgPaused}
+          proxyPaused={proxyPaused}
+        />
       )}
 
       {filtered.length > PAGE_SIZE
@@ -367,13 +448,23 @@ export function UsersPage() {
   );
 }
 
-function DriverWarning({ ssDown, wgDown }: { ssDown: boolean; wgDown: boolean }) {
+function DriverWarning({
+  ssDown,
+  wgDown,
+  proxyDown,
+}: {
+  ssDown: boolean;
+  wgDown: boolean;
+  proxyDown: boolean;
+}) {
   const { t } = useTranslation();
   const parts: string[] = [];
   if (ssDown)
     parts.push(t('common.protocolStrip.shadowsocks'));
   if (wgDown)
     parts.push(t('common.protocolStrip.wireguard'));
+  if (proxyDown)
+    parts.push(t('common.protocolStrip.proxy'));
   const protos = parts.join(t('users.driverJoiner'));
   const text
     = parts.length > 1
@@ -386,13 +477,23 @@ function DriverWarning({ ssDown, wgDown }: { ssDown: boolean; wgDown: boolean })
   );
 }
 
-function DriverPausedHint({ ssPaused, wgPaused }: { ssPaused: boolean; wgPaused: boolean }) {
+function DriverPausedHint({
+  ssPaused,
+  wgPaused,
+  proxyPaused,
+}: {
+  ssPaused: boolean;
+  wgPaused: boolean;
+  proxyPaused: boolean;
+}) {
   const { t } = useTranslation();
   const parts: string[] = [];
   if (ssPaused)
     parts.push(t('common.protocolStrip.shadowsocks'));
   if (wgPaused)
     parts.push(t('common.protocolStrip.wireguard'));
+  if (proxyPaused)
+    parts.push(t('common.protocolStrip.proxy'));
   const protos = parts.join(t('users.driverJoiner'));
   return (
     <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-xs text-amber-900 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-200">

@@ -4,6 +4,9 @@ import { ArrowLeft, Play, Square } from 'lucide-react';
 import { useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
+  useProxyStartMutation,
+  useProxyStatusQuery,
+  useProxyStopMutation,
   useSsStartMutation,
   useSsStatusQuery,
   useSsStopMutation,
@@ -32,10 +35,10 @@ import {
 import { useToaster } from '@/shared/components/ui/toast';
 import { formatTimestamp } from '@/shared/lib/utils';
 
-type ServiceId = 'shadowsocks' | 'wireguard';
+type ServiceId = 'shadowsocks' | 'wireguard' | 'proxy';
 
 function isServiceId(value: string): value is ServiceId {
-  return value === 'shadowsocks' || value === 'wireguard';
+  return value === 'shadowsocks' || value === 'wireguard' || value === 'proxy';
 }
 
 export function ServiceDetailPage() {
@@ -43,7 +46,11 @@ export function ServiceDetailPage() {
   if (!isServiceId(id))
     return <ServiceNotFound />;
 
-  return id === 'shadowsocks' ? <ShadowsocksDetail /> : <WireguardDetail />;
+  if (id === 'shadowsocks')
+    return <ShadowsocksDetail />;
+  if (id === 'wireguard')
+    return <WireguardDetail />;
+  return <ProxyDetail />;
 }
 
 function ServiceNotFound() {
@@ -100,6 +107,47 @@ function ShadowsocksDetail() {
       stopping={stop.isPending}
       fields={fields}
       users={ssUsers}
+      usersLoading={users.isLoading}
+    />
+  );
+}
+
+function ProxyDetail() {
+  const { t } = useTranslation();
+  const status = useProxyStatusQuery();
+  const start = useProxyStartMutation();
+  const stop = useProxyStopMutation();
+  const users = useUsersQuery();
+  const proxyUsers = useMemo<UserEntry[]>(
+    () => (users.data ?? []).filter((u) => u.proxy_enabled),
+    [users.data],
+  );
+  const data = status.data;
+  const driverDown = status.error?.isUnavailable() ?? false;
+
+  const fields: Array<[string, string | number | undefined | null]> = [
+    [t('serviceDetail.proxy.publicHost'), data?.public_host],
+    [t('serviceDetail.proxy.socks5Port'), data?.socks5_port],
+    [t('serviceDetail.proxy.httpPort'), data?.http_port],
+    [t('serviceDetail.proxy.users'), data?.users ?? proxyUsers.length],
+    [t('serviceDetail.proxy.reloads'), data?.reload_count],
+    [t('serviceDetail.proxy.lastSwap'), data ? formatMs(data.last_swap_ms) : null],
+  ];
+
+  return (
+    <ServiceDetailLayout
+      name={t('serviceDetail.proxy.title')}
+      description={t('services.descriptions.proxy')}
+      running={data?.running ?? false}
+      available={data?.available ?? true}
+      reason={data?.reason ?? null}
+      driverDown={driverDown}
+      onStart={() => start.mutate(undefined)}
+      onStop={() => stop.mutate(undefined)}
+      starting={start.isPending}
+      stopping={stop.isPending}
+      fields={fields}
+      users={proxyUsers}
       usersLoading={users.isLoading}
     />
   );

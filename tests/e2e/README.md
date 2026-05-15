@@ -59,7 +59,8 @@ also run serially.
 | 10 | Auth rotation — change password bumps `token_generation`, old JWT now 401, new password works |
 | 11 | Cleanup — disable / cascade delete, reconciler converges peer count to 0 |
 | 12 | Error hygiene — unknown user 404, unauthenticated 401 |
-| 13 | **Reverse-API control center** — *opt-in via `E2E_MODE=control*`*. Full-snapshot reconcile (users tagged `source=control`), local-API 403 on control-source mutations, delta delete, source-boundary id collision (asserts `/report` event), `/status` body shape (services + traffic + cursor), `/config` request hashes, iptables full-snapshot install, **policy-tagged**: `keep` keeps local extras / `prune` evicts them, server-driven `mode: replace` always prunes. Self-skips under the default runner. |
+| 13 | **SOCKS5 + HTTP CONNECT proxy** — `/api/protocol/proxy/status`, enable returns both URLs sharing one credential pair, rotate replaces password, stop/start transitions, disable drops user count back to baseline. |
+| 14 | **Reverse-API control center** — *opt-in via `E2E_MODE=control*`*. Full-snapshot reconcile (users tagged `source=control`), local-API 403 on control-source mutations, delta delete, source-boundary id collision (asserts `/report` event), `/status` body shape (services + traffic + cursor), `/config` request hashes, iptables full-snapshot install, **policy-tagged**: `keep` keeps local extras / `prune` evicts them, server-driven `mode: replace` always prunes. Self-skips under the default runner. |
 
 ## Layout
 

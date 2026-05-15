@@ -22,6 +22,8 @@ const METRIC_LABEL_KEYS: Record<string, string> = {
   'Peers': 'services.metrics.peers',
   'Listen port': 'services.metrics.listenPort',
   'Endpoint': 'services.metrics.endpoint',
+  'SOCKS5 port': 'services.metrics.socks5Port',
+  'HTTP port': 'services.metrics.httpPort',
 };
 
 export function ServicesPage() {
@@ -32,7 +34,7 @@ export function ServicesPage() {
         <h1 className="text-xl font-semibold tracking-tight">{t('services.heading')}</h1>
         <p className="text-sm text-muted-foreground">{t('services.subtitle')}</p>
       </div>
-      <div className="grid gap-4 md:grid-cols-2">
+      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
         {serviceDescriptors.map((svc) => (
           <ServiceCard key={svc.id} svc={svc} />
         ))}

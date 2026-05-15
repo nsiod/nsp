@@ -84,6 +84,10 @@ describe("phase 2 — settings", () => {
   });
 
   test("GET /api/audit returns an array", async () => {
+    // Shape-only on purpose: the admin API does not emit audit rows
+    // (only the reverse-API control reconciler does — see control.rs
+    // `AUDIT_ACTOR`). Under the default compose the log is empty, so
+    // content assertions live in phase 14 where the writer is active.
     const audit = await client.ok<unknown[]>("GET", "/api/audit?limit=10");
     expect(Array.isArray(audit)).toBe(true);
   });

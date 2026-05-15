@@ -72,6 +72,30 @@ export interface SsDetail {
   psk?: string;
 }
 
+export interface WgTrafficResponse {
+  user_id: string;
+  peer_id: string;
+  total_rx_bytes: number;
+  total_tx_bytes: number;
+  last_rx_seen: number | null;
+  last_tx_seen: number | null;
+  last_handshake_at: number | null;
+  updated_at: number | null;
+  samples: Array<{
+    at: number;
+    rx_bytes: number;
+    tx_bytes: number;
+  }>;
+}
+
+export interface AuditEntry {
+  actor: string;
+  action: string;
+  target: string | null;
+  detail: string | null;
+  at: number;
+}
+
 export interface IptablesRule {
   id: string;
   source: "wg-driver" | "user" | string;
@@ -103,4 +127,29 @@ export interface AuthLogin {
 
 export interface Me {
   sub: string;
+}
+
+export interface ProxyStatus {
+  running: boolean;
+  available: boolean;
+  socks5_port: number;
+  http_port: number;
+  public_host: string;
+  users: number;
+  reload_count: number;
+  reason?: string | null;
+}
+
+export interface ProxyEnableResponse {
+  user_id: string;
+  name: string;
+  username: string;
+  password: string;
+  socks5_url: string;
+  http_url: string;
+  pending: boolean;
+}
+
+export interface ProxyDisableAck {
+  pending: boolean;
 }

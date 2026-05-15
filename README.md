@@ -1,14 +1,17 @@
 # nsp
 
-A small, single-binary control plane that manages WireGuard and Shadowsocks
-users behind a signed API. State is a single SQLite file; secrets can be sealed
-at rest with a master key; metrics and hourly backups are built in.
+A small, single-binary control plane that manages WireGuard, Shadowsocks,
+and SOCKS5 / HTTP CONNECT proxy users behind a signed API. State is a single
+SQLite file; secrets can be sealed at rest with a master key; metrics and
+hourly backups are built in.
 
 * **HTTP/S control plane** — JWT-auth'd REST API + embedded admin SPA.
 * **WireGuard driver** — IPAM, peer lifecycle, native netlink apply
   loop. Pluggable data plane: in-kernel `wireguard` module via
   netlink (default) or in-process userspace (gotatun + TUN) fallback.
 * **Shadowsocks driver** — in-process task, debounced key reloads.
+* **Proxy driver** — SOCKS5 (RFC 1928 + 1929) and HTTP CONNECT (RFC 7231 + 7235)
+  on independent ports, sharing one credential set per user.
 * **Optional TLS** — Let's Encrypt via `rustls-acme` (TLS-ALPN-01), static
   certs, self-signed fallback, or plaintext HTTP for local/reverse-proxy use.
 * **Observability** — Prometheus `/metrics`, bearer- or JWT-gated.
@@ -131,6 +134,7 @@ Key sections:
 | `storage`     | SQLite path, work dir                    |
 | `wireguard`   | WG subnet, listen port, peer limits      |
 | `shadowsocks` | SS bind, port, apply debounce            |
+| `proxy`       | SOCKS5 + HTTP CONNECT ports, bind, debounce |
 | `metrics`     | Enable `/metrics`, optional bearer token |
 | `backup`      | Dir, interval, retention                 |
 | `control`     | Reverse-API control-center poller        |
@@ -166,6 +170,13 @@ and CLI flags:
 | `shadowsocks.bind`       | `NSP_SS_BIND`               | `--shadowsocks-bind`        |
 | `shadowsocks.port`       | `NSP_SS_PORT`               | `--shadowsocks-port`        |
 | `shadowsocks.apply_debounce_ms` | `NSP_SS_DEBOUNCE_MS` | `--shadowsocks-apply-debounce-ms` |
+| `proxy.enabled`          | `NSP_PROXY`                 | `--proxy-enabled`           |
+| `proxy.bind`             | `NSP_PROXY_BIND`            | `--proxy-bind`              |
+| `proxy.socks5_port`      | `NSP_PROXY_SOCKS5_PORT`     | `--proxy-socks5-port`       |
+| `proxy.http_port`        | `NSP_PROXY_HTTP_PORT`       | `--proxy-http-port`         |
+| `proxy.apply_debounce_ms` | `NSP_PROXY_DEBOUNCE_MS`    | `--proxy-apply-debounce-ms` |
+| `proxy.block_private_destinations` | `NSP_PROXY_BLOCK_PRIVATE` | `--proxy-block-private-destinations` |
+| `proxy.max_inflight`     | `NSP_PROXY_MAX_INFLIGHT`    | `--proxy-max-inflight`      |
 | `logging.level`          | `NSP_LOG`                   | `--logging-level`           |
 | `logging.json`           | `NSP_JSON_LOGS`             | `--logging-json`            |
 | `metrics.enabled`        | `NSP_METRICS`               | `--metrics-enabled`         |
@@ -213,6 +224,65 @@ For Docker deployments the container needs `--cap-add NET_ADMIN`.
 The kernel backend additionally needs the host's `wireguard` module
 loaded (`modprobe wireguard` on the host) — no extra host binaries
 required because the netlink path bypasses `wireguard-tools` entirely.
+
+---
+
+## Proxy exposure
+
+The SOCKS5 + HTTP CONNECT proxy is **disabled by default**. An open
+authenticated proxy on the public internet is a high-value target — bots
+scan well-known proxy ports (1080, 8080, 3128, …) continuously and will
+treat a single weak password as a free relay for spam, fraud, scraping,
+and DDoS reflection.
+
+Before flipping `proxy.enabled = true`:
+
+1. **Leave the docker-compose port mappings commented out.** The defaults
+   in `docker-compose.yml` ship `1080:1080/tcp` and `8080:8080/tcp`
+   commented out for this reason — never uncomment them on a host that
+   accepts traffic from the open internet without taking step 2 or 3.
+
+2. **Bind on a private interface.** Set `proxy.bind` to a WireGuard
+   internal address (the IP nsp listens on inside the `wg0` subnet) so
+   only clients already on the tunnel can reach the proxy. This is the
+   cleanest exposure pattern: a SOCKS5 user must first complete the
+   WG handshake.
+
+3. **Or restrict source IPs with iptables.** Use the firewall page (or
+   the `/api/iptables` endpoint) to allow only the source addresses you
+   trust:
+
+   ```
+   -A INPUT -p tcp -m multiport --dports 1080,8080 -s 198.51.100.0/24 -j ACCEPT
+   -A INPUT -p tcp -m multiport --dports 1080,8080 -j DROP
+   ```
+
+Password handling notes:
+
+* Per-user passwords are 24-char alphanumeric (`A-Za-z0-9`) — ~143 bits of
+  entropy. They are stored encrypted with the master data-key (XChaCha20-
+  Poly1305); plaintext is shown to the operator exactly once on enable /
+  rotate and is then discarded.
+* Argon2 is intentionally not used on the runtime auth path: the
+  credential rides on every new TCP connection, so a deliberately slow
+  hash would amortise badly across thousands of short-lived flows. The
+  in-memory compare uses `subtle::ConstantTimeEq`.
+* `POST /api/users/:id/proxy/rotate` regenerates the password and pushes
+  the new value through the apply loop; existing clients stop working
+  within one debounce window (default 500 ms).
+
+Built-in safety rails (always on, no config knob):
+
+* **Destination filter**: every CONNECT target is resolved through DNS,
+  then any address in `127.0.0.0/8`, `169.254.0.0/16`, `0.0.0.0/8`, `::1`,
+  `::`, or `fe80::/10` is refused (`SOCKS5 REP=0x01` / `HTTP 403`). This
+  blocks pivoting to the colocated admin API, cloud metadata endpoints
+  (IMDS at `169.254.169.254`), and DNS-rebinding attacks. RFC1918 / ULA
+  ranges are NOT blocked because pointing users at LAN / WireGuard-
+  internal hosts is a common deployment.
+* **Connection ceiling**: each listener caps the global in-flight count
+  at 4096 sockets. Beyond that, new TCP accepts are closed immediately,
+  bounding slowloris-style memory / FD exhaustion.
 
 ---
 
@@ -304,7 +374,7 @@ Release image build:
 
 ```shell
 docker build -f Dockerfile.release -t nsp:release .
-docker image inspect nsp:release --format '{{.Size}}'   # < 30 MB
+docker image inspect nsp:release --format '{{.Size}}'   # < 36 MB
 ```
 
 ## Local development

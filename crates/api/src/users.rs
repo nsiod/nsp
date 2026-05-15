@@ -22,6 +22,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use nsp_db::{UserRow, UserSource, UsersRepo, WgRepo};
+use nsp_proxy_driver::ProxyDriver;
 use nsp_ss_driver::SsDriver;
 use nsp_wg_driver::{PeerSecrets, PeerView, WgDriver, WgTrafficSample, WgTrafficSummary};
 use serde::{Deserialize, Serialize};
@@ -45,6 +46,13 @@ pub fn router() -> Router<Arc<AppState>> {
         )
         .route("/:id/wg/rotate", post(rotate_wg))
         .route("/:id/wg/traffic", get(wg_traffic))
+        .route(
+            "/:id/proxy",
+            get(get_proxy_detail)
+                .post(enable_proxy)
+                .delete(disable_proxy),
+        )
+        .route("/:id/proxy/rotate", post(rotate_proxy))
 }
 
 pub fn protected_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
@@ -65,6 +73,13 @@ fn wg_driver(state: &AppState) -> Result<&WgDriver, ApiError> {
         .ok_or_else(|| ApiError::Unavailable("wireguard disabled".to_owned()))
 }
 
+fn proxy_driver(state: &AppState) -> Result<&ProxyDriver, ApiError> {
+    state
+        .proxy
+        .as_ref()
+        .ok_or_else(|| ApiError::Unavailable("proxy driver not initialised".to_owned()))
+}
+
 // ---------- DTOs ----------
 
 #[derive(Debug, Serialize)]
@@ -74,6 +89,7 @@ pub struct UserDto {
     pub created_at: i64,
     pub ss_enabled: bool,
     pub wg_enabled: bool,
+    pub proxy_enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     /// `local` (admin-created via this API) or `control` (managed by
@@ -90,6 +106,7 @@ impl From<UserRow> for UserDto {
             created_at: r.created_at,
             ss_enabled: r.ss_enabled,
             wg_enabled: r.wg_enabled,
+            proxy_enabled: r.proxy_enabled,
             note: r.note,
             source: r.source,
         }
@@ -630,6 +647,124 @@ async fn rotate_wg(
         user_id: id,
         peer: WgPeerDto::from(view),
         secrets: Some(WgPeerSecretsDto::from(secrets)),
+        pending,
+    }))
+}
+
+// ---------- Proxy per-user ----------
+
+#[derive(Debug, Serialize)]
+pub struct ProxyEnableResponse {
+    pub user_id: String,
+    pub name: String,
+    pub username: String,
+    /// One-shot password. The server stores only the encrypted blob and
+    /// never returns the plaintext again — rotate to obtain a fresh one.
+    pub password: String,
+    pub socks5_url: String,
+    pub http_url: String,
+    /// `true` when the proxy driver was not running at write time — the
+    /// reconciler converges on next start.
+    pub pending: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProxyDetailResponse {
+    pub user_id: String,
+    pub name: String,
+    pub username: String,
+    pub socks5_url: String,
+    pub http_url: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+async fn get_proxy_detail(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ProxyDetailResponse>, ApiError> {
+    let users = UsersRepo::new(&state.db);
+    let user = users.get(&id).await?.ok_or(ApiError::NotFound)?;
+    if !user.proxy_enabled {
+        return Err(ApiError::NotFound);
+    }
+    let d = proxy_driver(&state)?;
+    let repo = nsp_db::ProxyRepo::new(&state.db);
+    let cred = repo.get_by_user(&id).await?.ok_or(ApiError::NotFound)?;
+    let host = d.public_host().await;
+    let socks5_port = d.socks5_port().await;
+    let http_port = d.http_port().await;
+    Ok(Json(ProxyDetailResponse {
+        user_id: user.id,
+        name: user.name,
+        username: cred.username.clone(),
+        // The detail endpoint does NOT include the password — the
+        // server cannot retrieve plaintext credentials after enable;
+        // the URLs are rendered with a placeholder that signals the
+        // caller must rotate to obtain fresh material.
+        socks5_url: format!("socks5://{}@{host}:{socks5_port}", cred.username),
+        http_url: format!("http://{}@{host}:{http_port}", cred.username),
+        created_at: cred.created_at,
+        updated_at: cred.updated_at,
+    }))
+}
+
+async fn enable_proxy(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<ProxyEnableResponse>), ApiError> {
+    let d = proxy_driver(&state)?;
+    let material = d.enable_user(&id).await?;
+    state.notify_reconciler();
+    let pending = !d.is_running().await;
+    Ok((
+        StatusCode::CREATED,
+        Json(ProxyEnableResponse {
+            user_id: material.user_id,
+            name: material.name,
+            username: material.username,
+            password: material.password,
+            socks5_url: material.socks5_url,
+            http_url: material.http_url,
+            pending,
+        }),
+    ))
+}
+
+async fn disable_proxy(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<AckResponse>, ApiError> {
+    let d = proxy_driver(&state)?;
+    let removed = d.disable_user(&id).await?;
+    state.notify_reconciler();
+    if !removed {
+        return Err(ApiError::NotFound);
+    }
+    let pending = !d.is_running().await;
+    Ok(Json(AckResponse { pending }))
+}
+
+async fn rotate_proxy(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ProxyEnableResponse>, ApiError> {
+    let users = UsersRepo::new(&state.db);
+    let user = users.get(&id).await?.ok_or(ApiError::NotFound)?;
+    if !user.proxy_enabled {
+        return Err(ApiError::NotFound);
+    }
+    let d = proxy_driver(&state)?;
+    let material = d.rotate_user(&id).await?;
+    state.notify_reconciler();
+    let pending = !d.is_running().await;
+    Ok(Json(ProxyEnableResponse {
+        user_id: material.user_id,
+        name: material.name,
+        username: material.username,
+        password: material.password,
+        socks5_url: material.socks5_url,
+        http_url: material.http_url,
         pending,
     }))
 }

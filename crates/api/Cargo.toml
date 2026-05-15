@@ -15,6 +15,7 @@ path = "src/lib.rs"
 nsp-core = { path = "../core" }
 nsp-db = { path = "../db" }
 nsp-netctl = { path = "../netctl" }
+nsp-proxy-driver = { path = "../proxy-driver" }
 nsp-ss-driver = { path = "../ss-driver" }
 nsp-wg-driver = { path = "../wg-driver" }
 

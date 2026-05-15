@@ -33,4 +33,10 @@ services:
       - "4433:4433/tcp"
       - "4433:4433/udp"
       - "51820:51820/udp"
+      # SOCKS5 + HTTP CONNECT proxy — DO NOT uncomment without
+      # restricting the source addresses (firewall, WireGuard subnet,
+      # etc.). An authenticated proxy on the public internet is
+      # actively scanned and abused for spam, fraud, and DDoS relaying.
+      # - "1080:1080/tcp"
+      # - "8080:8080/tcp"
     restart: unless-stopped

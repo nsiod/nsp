@@ -26,6 +26,7 @@ use nsp_core::{
     spawn_reconciler,
 };
 use nsp_netctl::{DefaultManager, IptablesManager, ProcessBackend};
+use nsp_proxy_driver::{ProxyDriver, ProxyDriverConfig};
 use nsp_ss_driver::{SsDriver, SsDriverConfig};
 use nsp_wg_driver::{WgConfig, WgDriver};
 use secrecy::{ExposeSecret, SecretString};
@@ -181,12 +182,45 @@ async fn run_serve(args: cli::ServeArgs) -> anyhow::Result<()> {
             domain,
             config.shadowsocks.apply_debounce_ms,
         );
-        let ss = SsDriver::new(ss_cfg, pool.clone(), master_key);
+        let ss = SsDriver::new(ss_cfg, pool.clone(), master_key.clone());
         ss.spawn().await.context("spawn ss driver")?;
         app_state = app_state.with_ss_driver(ss.clone());
         Some(ss)
     } else {
         tracing::info!("shadowsocks driver disabled by config");
+        None
+    };
+
+    let proxy_driver: Option<ProxyDriver> = if config.proxy.enabled {
+        let host = config
+            .http
+            .domain
+            .clone()
+            .unwrap_or_else(|| config.proxy.bind.to_string());
+        let mut proxy_cfg = ProxyDriverConfig::new(
+            config.proxy.bind,
+            config.proxy.socks5_port,
+            config.proxy.http_port,
+            host,
+            config.proxy.apply_debounce_ms,
+        );
+        proxy_cfg.block_private_destinations = config.proxy.block_private_destinations;
+        proxy_cfg.max_inflight = config.proxy.max_inflight;
+        let proxy = ProxyDriver::new(proxy_cfg, pool.clone(), master_key);
+        match proxy.start().await {
+            Ok(()) => tracing::info!("proxy driver up"),
+            Err(err) => {
+                // Refuse to fail the whole startup when the proxy
+                // ports are unavailable — the operator can fix the
+                // bind via /api/settings or env and restart, but other
+                // protocols should keep working in the meantime.
+                tracing::warn!(%err, "proxy spawn failed; driver registered in paused state");
+            }
+        }
+        app_state = app_state.with_proxy(proxy.clone());
+        Some(proxy)
+    } else {
+        tracing::info!("proxy driver disabled by config");
         None
     };
 
@@ -200,6 +234,9 @@ async fn run_serve(args: cli::ServeArgs) -> anyhow::Result<()> {
     if let Some(wg) = wg.clone() {
         reconcile_targets.push(Arc::new(wg) as Arc<dyn ReconcileTarget>);
     }
+    if let Some(p) = proxy_driver.clone() {
+        reconcile_targets.push(Arc::new(p) as Arc<dyn ReconcileTarget>);
+    }
     let reconciler = spawn_reconciler(reconcile_targets, ReconcilerConfig::default());
     let notify = reconciler.notify_handle();
     if let Some(ss) = ss_driver.as_ref() {
@@ -207,6 +244,9 @@ async fn run_serve(args: cli::ServeArgs) -> anyhow::Result<()> {
     }
     if let Some(wg) = wg.as_ref() {
         wg.set_reconcile_notify(notify.clone()).await;
+    }
+    if let Some(p) = proxy_driver.as_ref() {
+        p.set_reconcile_notify(notify.clone()).await;
     }
     app_state = app_state.with_reconciler(reconciler);
 
@@ -279,7 +319,16 @@ async fn run_serve(args: cli::ServeArgs) -> anyhow::Result<()> {
             api = ?config.security.api,
             "listener mode selected",
         );
-        server::serve(config.http.listen, acceptor, router, pool, ss_driver, wg).await
+        server::serve(
+            config.http.listen,
+            acceptor,
+            router,
+            pool,
+            ss_driver,
+            wg,
+            proxy_driver,
+        )
+        .await
     } else {
         // Headless mode (`api = "disabled"`): no router, no
         // listener, no port bound. `nmap` / `ss -lntp` will not see
@@ -291,7 +340,7 @@ async fn run_serve(args: cli::ServeArgs) -> anyhow::Result<()> {
         // `NSP_API=disabled` runs as a passive data plane with no
         // admin channel at all (legitimate, if unusual).
         tracing::info!("api=disabled — listener not bound; admin port is not present on this host");
-        server::wait_for_shutdown_signal(pool, ss_driver, wg).await
+        server::wait_for_shutdown_signal(pool, ss_driver, wg, proxy_driver).await
     };
 
     if let Some(t) = backup_task {

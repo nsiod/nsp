@@ -17,8 +17,8 @@ pub mod traffic;
 
 pub use iptables::{IptablesRepo, IptablesRuleInsert, IptablesRuleRow};
 pub use repo::{
-    AuditLogRow, AuditRepo, ServerConfigRepo, SsRepo, SsUserRow, UserRow, UserSource, UsersRepo,
-    WgPeerInsert, WgPeerRow, WgRepo,
+    AuditLogRow, AuditRepo, ProxyCredentialRow, ProxyRepo, ServerConfigRepo, SsRepo, SsUserRow,
+    UserRow, UserSource, UsersRepo, WgPeerInsert, WgPeerRow, WgRepo,
 };
 pub use settings::{SettingsPatch, SettingsRepo, SettingsRow};
 pub use traffic::{

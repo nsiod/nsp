@@ -8,6 +8,7 @@ use axum::{
 use nsp_core::CoreError;
 use nsp_db::DbError;
 use nsp_netctl::NetctlError;
+use nsp_proxy_driver::ProxyError;
 use nsp_ss_driver::SsError;
 use nsp_wg_driver::WgError;
 use serde::Serialize;
@@ -62,6 +63,9 @@ pub enum ApiError {
 
     #[error(transparent)]
     Ss(#[from] SsError),
+
+    #[error(transparent)]
+    Proxy(#[from] ProxyError),
 }
 
 impl From<DbError> for ApiError {
@@ -132,6 +136,7 @@ impl ApiError {
             Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::Ss(err) => ss_status(err),
+            Self::Proxy(err) => proxy_status(err),
             Self::Internal | Self::Core(_) | Self::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -148,6 +153,7 @@ impl ApiError {
             Self::Unavailable(_) => "about:blank#unavailable",
             Self::RateLimited => "about:blank#rate-limited",
             Self::Ss(err) => ss_problem_type(err),
+            Self::Proxy(err) => proxy_problem_type(err),
             _ => "about:blank#internal",
         }
     }
@@ -164,6 +170,7 @@ impl ApiError {
             Self::Unavailable(_) => "Service Unavailable",
             Self::RateLimited => "Too Many Requests",
             Self::Ss(err) => ss_title(err),
+            Self::Proxy(err) => proxy_title(err),
             _ => "Internal Server Error",
         }
     }
@@ -192,6 +199,33 @@ fn ss_title(err: &SsError) -> &'static str {
         SsError::NotFound => "Not Found",
         SsError::Invalid(_) => "Bad Request",
         SsError::NotRunning => "Service Unavailable",
+        _ => "Internal Server Error",
+    }
+}
+
+fn proxy_status(err: &ProxyError) -> StatusCode {
+    match err {
+        ProxyError::NotFound => StatusCode::NOT_FOUND,
+        ProxyError::Invalid(_) => StatusCode::BAD_REQUEST,
+        ProxyError::NotRunning => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn proxy_problem_type(err: &ProxyError) -> &'static str {
+    match err {
+        ProxyError::NotFound => "about:blank#not-found",
+        ProxyError::Invalid(_) => "about:blank#bad-request",
+        ProxyError::NotRunning => "about:blank#unavailable",
+        _ => "about:blank#internal",
+    }
+}
+
+fn proxy_title(err: &ProxyError) -> &'static str {
+    match err {
+        ProxyError::NotFound => "Not Found",
+        ProxyError::Invalid(_) => "Bad Request",
+        ProxyError::NotRunning => "Service Unavailable",
         _ => "Internal Server Error",
     }
 }
@@ -254,6 +288,16 @@ impl IntoResponse for ApiError {
                         | SsError::Core(_)
                         | SsError::Db(_)
                         | SsError::Io(_)
+                )
+            )
+            || matches!(
+                self,
+                Self::Proxy(
+                    ProxyError::Config(_)
+                        | ProxyError::Task(_)
+                        | ProxyError::Core(_)
+                        | ProxyError::Db(_)
+                        | ProxyError::Io(_)
                 )
             )
         {

@@ -1,12 +1,13 @@
 -- Initial schema for nsp.
 
 CREATE TABLE IF NOT EXISTS users (
-  id         TEXT PRIMARY KEY,
-  name       TEXT NOT NULL UNIQUE,
-  created_at INTEGER NOT NULL,
-  ss_enabled INTEGER NOT NULL DEFAULT 0,
-  wg_enabled INTEGER NOT NULL DEFAULT 0,
-  note       TEXT
+  id            TEXT PRIMARY KEY,
+  name          TEXT NOT NULL UNIQUE,
+  created_at    INTEGER NOT NULL,
+  ss_enabled    INTEGER NOT NULL DEFAULT 0,
+  wg_enabled    INTEGER NOT NULL DEFAULT 0,
+  proxy_enabled INTEGER NOT NULL DEFAULT 0,
+  note          TEXT
 );
 
 CREATE TABLE IF NOT EXISTS ss_credentials (
@@ -34,6 +35,17 @@ CREATE TABLE IF NOT EXISTS wg_peers (
 
 CREATE INDEX IF NOT EXISTS idx_wg_peers_user_id ON wg_peers(user_id);
 CREATE INDEX IF NOT EXISTS idx_wg_peers_allowed_ip ON wg_peers(allowed_ip);
+
+-- SOCKS5 + HTTP CONNECT proxy credentials. One row per proxy-enabled
+-- user; both protocols share the same username/password pair. Passwords
+-- are sealed with the master data-key before they reach this table.
+CREATE TABLE IF NOT EXISTS proxy_credentials (
+  user_id      TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  username     TEXT NOT NULL UNIQUE,
+  password_enc BLOB NOT NULL,
+  created_at   INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS server_config (
   key   TEXT PRIMARY KEY,

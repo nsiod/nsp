@@ -4,7 +4,7 @@
 // own per-phase client instance.
 
 import type { Client } from "./client.ts";
-import type { SsStatus, WgStatus } from "./types.ts";
+import type { ProxyStatus, SsStatus, WgStatus } from "./types.ts";
 
 export function wgRunningIs(client: Client, want: boolean) {
   return async (): Promise<boolean> => {
@@ -24,5 +24,35 @@ export function ssRunningIs(client: Client, want: boolean) {
   return async (): Promise<boolean> => {
     const s = await client.ok<SsStatus>("GET", "/api/protocol/ss/status");
     return s.running === want;
+  };
+}
+
+export function proxyRunningIs(client: Client, want: boolean) {
+  return async (): Promise<boolean> => {
+    const s = await client.ok<ProxyStatus>(
+      "GET",
+      "/api/protocol/proxy/status",
+    );
+    return s.running === want;
+  };
+}
+
+export function proxyUsersIs(client: Client, want: number) {
+  return async (): Promise<boolean> => {
+    const s = await client.ok<ProxyStatus>(
+      "GET",
+      "/api/protocol/proxy/status",
+    );
+    return s.users === want;
+  };
+}
+
+export function proxyUsersAtLeast(client: Client, want: number) {
+  return async (): Promise<boolean> => {
+    const s = await client.ok<ProxyStatus>(
+      "GET",
+      "/api/protocol/proxy/status",
+    );
+    return s.users >= want;
   };
 }

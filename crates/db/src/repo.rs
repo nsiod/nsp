@@ -14,6 +14,10 @@ pub struct WgRepo<'a> {
     pub pool: &'a Pool,
 }
 
+pub struct ProxyRepo<'a> {
+    pub pool: &'a Pool,
+}
+
 pub struct ServerConfigRepo<'a> {
     pub pool: &'a Pool,
 }
@@ -100,20 +104,22 @@ pub struct UserRow {
     pub created_at: i64,
     pub ss_enabled: bool,
     pub wg_enabled: bool,
+    pub proxy_enabled: bool,
     pub note: Option<String>,
     pub source: UserSource,
 }
 
-type UserTuple = (String, String, i64, i64, i64, Option<String>, String);
+type UserTuple = (String, String, i64, i64, i64, i64, Option<String>, String);
 
 fn user_row_from_tuple(t: UserTuple) -> UserRow {
-    let (id, name, created_at, ss_enabled, wg_enabled, note, source) = t;
+    let (id, name, created_at, ss_enabled, wg_enabled, proxy_enabled, note, source) = t;
     UserRow {
         id,
         name,
         created_at,
         ss_enabled: ss_enabled != 0,
         wg_enabled: wg_enabled != 0,
+        proxy_enabled: proxy_enabled != 0,
         note,
         // Unknown tags shouldn't exist in production, but if they do
         // we treat them as Local to avoid the control reconciler
@@ -144,7 +150,7 @@ impl<'a> UsersRepo<'a> {
         Ok(n)
     }
 
-    /// Insert a naked Local user (both protocol flags 0). Returns
+    /// Insert a naked Local user (all protocol flags 0). Returns
     /// `Err(DbError::Invalid)` when `name` conflicts with an existing
     /// row. Convenience wrapper for the admin API path.
     pub async fn create(&self, id: &str, name: &str, note: Option<&str>) -> crate::Result<()> {
@@ -164,8 +170,8 @@ impl<'a> UsersRepo<'a> {
     ) -> crate::Result<()> {
         let now = chrono::Utc::now().timestamp();
         sqlx::query(
-            "INSERT INTO users(id, name, created_at, ss_enabled, wg_enabled, note, source)
-             VALUES (?, ?, ?, 0, 0, ?, ?)",
+            "INSERT INTO users(id, name, created_at, ss_enabled, wg_enabled, proxy_enabled, note, source)
+             VALUES (?, ?, ?, 0, 0, 0, ?, ?)",
         )
         .bind(id)
         .bind(name)
@@ -187,7 +193,7 @@ impl<'a> UsersRepo<'a> {
     /// Fetch a single user row by id.
     pub async fn get(&self, id: &str) -> crate::Result<Option<UserRow>> {
         let row: Option<UserTuple> = sqlx::query_as(
-            "SELECT id, name, created_at, ss_enabled, wg_enabled, note, source
+            "SELECT id, name, created_at, ss_enabled, wg_enabled, proxy_enabled, note, source
                FROM users WHERE id = ?",
         )
         .bind(id)
@@ -202,7 +208,7 @@ impl<'a> UsersRepo<'a> {
     pub async fn list(&self, source: Option<UserSource>) -> crate::Result<Vec<UserRow>> {
         let rows: Vec<UserTuple> = if let Some(s) = source {
             sqlx::query_as(
-                "SELECT id, name, created_at, ss_enabled, wg_enabled, note, source
+                "SELECT id, name, created_at, ss_enabled, wg_enabled, proxy_enabled, note, source
                    FROM users
                   WHERE source = ?
                   ORDER BY created_at ASC, id ASC",
@@ -212,7 +218,7 @@ impl<'a> UsersRepo<'a> {
             .await?
         } else {
             sqlx::query_as(
-                "SELECT id, name, created_at, ss_enabled, wg_enabled, note, source
+                "SELECT id, name, created_at, ss_enabled, wg_enabled, proxy_enabled, note, source
                    FROM users
                   ORDER BY created_at ASC, id ASC",
             )
@@ -220,6 +226,21 @@ impl<'a> UsersRepo<'a> {
             .await?
         };
         Ok(rows.into_iter().map(user_row_from_tuple).collect())
+    }
+
+    /// Set the `proxy_enabled` flag on a user row. Returns `true` when
+    /// the row existed and was updated. Used by `ProxyRepo::enable_user`
+    /// / `disable_user` internally, but exposed here for completeness and
+    /// for callers that need to flip the flag without touching the
+    /// credential blob.
+    pub async fn set_proxy_enabled(&self, id: &str, enabled: bool) -> crate::Result<bool> {
+        let value = i64::from(enabled);
+        let result = sqlx::query("UPDATE users SET proxy_enabled = ? WHERE id = ?")
+            .bind(value)
+            .bind(id)
+            .execute(self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     /// Rename a user. Returns `true` when a row was updated.
@@ -345,8 +366,8 @@ impl<'a> SsRepo<'a> {
         let now = chrono::Utc::now().timestamp();
         let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO users(id, name, created_at, ss_enabled, wg_enabled, note, source)
-             VALUES (?, ?, ?, 1, 0, ?, 'local')",
+            "INSERT INTO users(id, name, created_at, ss_enabled, wg_enabled, proxy_enabled, note, source)
+             VALUES (?, ?, ?, 1, 0, 0, ?, 'local')",
         )
         .bind(id)
         .bind(name)
@@ -796,4 +817,168 @@ fn row_into_peer(row: WgPeerTuple) -> crate::Result<WgPeerRow> {
         created_at,
         updated_at,
     })
+}
+
+/// A single proxy-enabled user joined with the encrypted password blob.
+/// Consumers decrypt the blob at the edge so the DB layer never sees
+/// plaintext credentials.
+#[derive(Debug, Clone)]
+pub struct ProxyCredentialRow {
+    pub user_id: String,
+    pub username: String,
+    pub password_enc: Vec<u8>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+type ProxyTuple = (String, String, Vec<u8>, i64, i64);
+
+fn proxy_row_from_tuple(t: ProxyTuple) -> ProxyCredentialRow {
+    let (user_id, username, password_enc, created_at, updated_at) = t;
+    ProxyCredentialRow {
+        user_id,
+        username,
+        password_enc,
+        created_at,
+        updated_at,
+    }
+}
+
+impl<'a> ProxyRepo<'a> {
+    pub fn new(pool: &'a Pool) -> Self {
+        Self { pool }
+    }
+
+    /// Enable the proxy for an existing user: upsert the credential row
+    /// and flip `users.proxy_enabled = 1` atomically. Requires that
+    /// `user_id` already exists in `users`. Returns
+    /// `Err(DbError::Invalid)` when `username` conflicts with another
+    /// user's credential row.
+    pub async fn enable_user(
+        &self,
+        user_id: &str,
+        username: &str,
+        password_enc: &[u8],
+    ) -> crate::Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let mut tx = self.pool.begin().await?;
+        let exists: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM users WHERE id = ?")
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if exists.is_none() {
+            return Err(crate::DbError::NotFound);
+        }
+        // Upsert: the user may have an existing row with a different
+        // username; we replace both the username and the password blob.
+        // The UNIQUE index on `username` rejects rows where the new value
+        // is already claimed by a different user.
+        sqlx::query(
+            "INSERT INTO proxy_credentials(user_id, username, password_enc, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username,
+                password_enc = excluded.password_enc,
+                updated_at = excluded.updated_at",
+        )
+        .bind(user_id)
+        .bind(username)
+        .bind(password_enc)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            if is_unique_violation(&e) {
+                crate::DbError::Invalid(format!("proxy username already exists: {username}"))
+            } else {
+                crate::DbError::Sqlx(e)
+            }
+        })?;
+        sqlx::query("UPDATE users SET proxy_enabled = 1 WHERE id = ?")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Disable the proxy for `user_id`: delete the credential row and
+    /// clear `users.proxy_enabled`. Returns `true` when the user
+    /// existed (regardless of whether a credential row was present).
+    pub async fn disable_user(&self, user_id: &str) -> crate::Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM proxy_credentials WHERE user_id = ?")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        let result = sqlx::query("UPDATE users SET proxy_enabled = 0 WHERE id = ?")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Fetch the credential row attached to `user_id`, if any.
+    pub async fn get_by_user(&self, user_id: &str) -> crate::Result<Option<ProxyCredentialRow>> {
+        let row: Option<ProxyTuple> = sqlx::query_as(
+            "SELECT user_id, username, password_enc, created_at, updated_at
+               FROM proxy_credentials WHERE user_id = ?",
+        )
+        .bind(user_id)
+        .fetch_optional(self.pool)
+        .await?;
+        Ok(row.map(proxy_row_from_tuple))
+    }
+
+    /// Fetch the credential row matching `username`. The username is the
+    /// public identifier used by SOCKS5 / HTTP CONNECT clients.
+    pub async fn get_by_username(
+        &self,
+        username: &str,
+    ) -> crate::Result<Option<ProxyCredentialRow>> {
+        let row: Option<ProxyTuple> = sqlx::query_as(
+            "SELECT user_id, username, password_enc, created_at, updated_at
+               FROM proxy_credentials WHERE username = ?",
+        )
+        .bind(username)
+        .fetch_optional(self.pool)
+        .await?;
+        Ok(row.map(proxy_row_from_tuple))
+    }
+
+    /// Replace only the password blob for an existing user. Returns
+    /// `true` when a credential row was updated; `false` when the user
+    /// has no credential row (caller should fall back to `enable_user`).
+    pub async fn update_password(
+        &self,
+        user_id: &str,
+        new_password_enc: &[u8],
+    ) -> crate::Result<bool> {
+        let now = chrono::Utc::now().timestamp();
+        let result = sqlx::query(
+            "UPDATE proxy_credentials
+                SET password_enc = ?, updated_at = ?
+              WHERE user_id = ?",
+        )
+        .bind(new_password_enc)
+        .bind(now)
+        .bind(user_id)
+        .execute(self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// List every proxy-enabled user credential in creation order.
+    pub async fn list(&self) -> crate::Result<Vec<ProxyCredentialRow>> {
+        let rows: Vec<ProxyTuple> = sqlx::query_as(
+            "SELECT user_id, username, password_enc, created_at, updated_at
+               FROM proxy_credentials
+              ORDER BY created_at ASC, user_id ASC",
+        )
+        .fetch_all(self.pool)
+        .await?;
+        Ok(rows.into_iter().map(proxy_row_from_tuple).collect())
+    }
 }

@@ -6,6 +6,7 @@ members = [
     "crates/db",
     "crates/ss-driver",
     "crates/wg-driver",
+    "crates/proxy-driver",
     "crates/netctl",
     "crates/api",
 ]

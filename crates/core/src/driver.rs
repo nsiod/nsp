@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 pub enum ProtocolKind {
     Shadowsocks,
     WireGuard,
+    Proxy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

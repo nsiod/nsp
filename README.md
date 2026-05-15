@@ -374,7 +374,7 @@ Release image build:
 
 ```shell
 docker build -f Dockerfile.release -t nsp:release .
-docker image inspect nsp:release --format '{{.Size}}'   # < 30 MB
+docker image inspect nsp:release --format '{{.Size}}'   # < 36 MB
 ```
 
 ## Local development

@@ -32,7 +32,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 
 import type { Client } from "./lib/client.ts";
 import { bootstrapClient, uniqueSuffix } from "./lib/setup.ts";
-import type { IptablesRule, User } from "./lib/types.ts";
+import type { AuditEntry, IptablesRule, User } from "./lib/types.ts";
 import { waitUntil } from "./lib/wait.ts";
 
 const MOCK_BASE = process.env["MOCK_CONTROL_BASE"] ?? "";
@@ -165,6 +165,29 @@ describe.skipIf(!CONTROL_ACTIVE)(
 
     const bob = await findUserById(client, controlUserB);
     expect(bob?.source).toBe("control");
+  });
+
+  test("audit log records the control reconcile (actor=control)", async () => {
+    // control.rs emits best-effort audit rows (actor "control") on
+    // every reconcile mutation. The full-snapshot test above created
+    // two control-source users, so by now the log must carry at
+    // least one control-actor entry. This is the only flow in the
+    // suite that produces audit rows — the admin API does not write
+    // audit (documented gap), so phase 02 only shape-checks.
+    const entry = await waitUntil(
+      CONVERGE_BUDGET_MS,
+      async () => {
+        const log = await client.ok<AuditEntry[]>(
+          "GET",
+          "/api/audit?limit=50",
+        );
+        return log.find((e) => e.actor === "control") ?? null;
+      },
+      { label: "audit log carries a control-actor entry" },
+    );
+    expect(entry.actor).toBe("control");
+    expect(typeof entry.action).toBe("string");
+    expect(entry.action.length).toBeGreaterThan(0);
   });
 
   test("local API refuses to mutate control-source users", async () => {

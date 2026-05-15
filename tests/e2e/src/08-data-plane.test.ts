@@ -18,6 +18,7 @@ import type {
   WgEnableResponse,
   WgPeerDto,
   WgStatus,
+  WgTrafficResponse,
 } from "./lib/types.ts";
 import { waitUntil } from "./lib/wait.ts";
 
@@ -139,6 +140,46 @@ describe("phase 8 — WG data plane", () => {
       { label: "peer rx/tx_bytes > 0 in API" },
     );
   });
+
+  test("GET /api/users/:id/wg/traffic — endpoint contract", async () => {
+    // Contract check is immediate: the route/handler/repo wiring
+    // returns a well-formed summary even before the first sampler
+    // tick (empty summary => zeros + []). This proves the endpoint
+    // works without coupling to the 60s sampler cadence.
+    const t = await client.ok<WgTrafficResponse>(
+      "GET",
+      `/api/users/${userId}/wg/traffic`,
+    );
+    expect(t.user_id).toBe(userId);
+    expect(typeof t.peer_id).toBe("string");
+    expect(t.peer_id.length).toBeGreaterThan(0);
+    expect(typeof t.total_rx_bytes).toBe("number");
+    expect(typeof t.total_tx_bytes).toBe("number");
+    expect(Array.isArray(t.samples)).toBe(true);
+  });
+
+  test("GET /api/users/:id/wg/traffic — sampler persists real bytes", async () => {
+    // The sampler ticks every SAMPLE_INTERVAL (60s, hardcoded in
+    // wg-driver/src/traffic.rs) and the first tick is consumed, so
+    // the first persisted row lands ~60s after bring-up. Wait past
+    // one full interval + slack to prove the ping traffic above is
+    // actually persisted to SQLite and surfaced by the endpoint.
+    await waitUntil(
+      80_000,
+      async () => {
+        const t = await client.ok<WgTrafficResponse>(
+          "GET",
+          `/api/users/${userId}/wg/traffic`,
+        );
+        return (
+          t.total_rx_bytes > 0 &&
+          t.total_tx_bytes > 0 &&
+          t.samples.length > 0
+        );
+      },
+      { label: "wg/traffic persisted rx/tx + samples" },
+    );
+  }, 90_000);
 
   test("wg show reports a recent handshake", async () => {
     const out = await shTrim(["wg", "show", WG_IF, "latest-handshakes"]);

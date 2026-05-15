@@ -19,7 +19,8 @@ import {
   proxyUsersAtLeast,
   proxyUsersIs,
 } from "./lib/predicates.ts";
-import { bootstrapClient, uniqueSuffix } from "./lib/setup.ts";
+import { sh } from "./lib/sh.ts";
+import { bootstrapClient, env, uniqueSuffix } from "./lib/setup.ts";
 import type {
   DisableAck,
   ProxyEnableResponse,
@@ -53,7 +54,13 @@ afterAll(async () => {
 });
 
 describe("phase 13 — SOCKS5 + HTTP CONNECT proxy", () => {
+  let username = "";
   let password = "";
+  // CONNECT target: nsp's own public health endpoint. From the
+  // proxy's vantage point inside the nsp container, `nsp` resolves
+  // to the bridge IP (RFC1918) — allowed by the default destination
+  // policy (loopback/link-local blocked, private allowed).
+  const target = `http://${env.serverHost}:8443/api/healthz`;
 
   test("GET /api/protocol/proxy/status — driver running on both ports", async () => {
     const s = await client.ok<ProxyStatus>(
@@ -83,6 +90,7 @@ describe("phase 13 — SOCKS5 + HTTP CONNECT proxy", () => {
     );
     expect(enable.http_url).toContain(`${enable.username}:${enable.password}@`);
     expect(enable.pending).toBe(false);
+    username = enable.username;
     password = enable.password;
   });
 
@@ -93,6 +101,85 @@ describe("phase 13 — SOCKS5 + HTTP CONNECT proxy", () => {
     await waitUntil(5_000, proxyUsersAtLeast(client, 1), {
       label: "proxy.users>=1",
     });
+  });
+
+  test("data plane — SOCKS5 CONNECT carries traffic with valid creds", async () => {
+    // The credential lands in the proxy's in-memory auth map via the
+    // reconciler; the user-count test above already waited for that.
+    const r = await sh(
+      [
+        "curl",
+        "-s",
+        "--max-time",
+        "10",
+        "--socks5",
+        `${username}:${password}@${env.serverHost}:1080`,
+        target,
+      ],
+      { failOk: true },
+    );
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain('"ok":true');
+  });
+
+  test("data plane — HTTP CONNECT carries traffic with valid creds", async () => {
+    // -p forces curl to issue CONNECT even for an http:// target
+    // (our proxy only implements the CONNECT verb).
+    const r = await sh(
+      [
+        "curl",
+        "-s",
+        "--max-time",
+        "10",
+        "-p",
+        "-x",
+        `http://${username}:${password}@${env.serverHost}:8080`,
+        target,
+      ],
+      { failOk: true },
+    );
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain('"ok":true');
+  });
+
+  test("data plane — SOCKS5 rejects a bad password", async () => {
+    const r = await sh(
+      [
+        "curl",
+        "-s",
+        "--max-time",
+        "10",
+        "--socks5",
+        `${username}:wrong-${password}@${env.serverHost}:1080`,
+        target,
+      ],
+      { failOk: true },
+    );
+    // curl exits non-zero when SOCKS5 auth is refused.
+    expect(r.code).not.toBe(0);
+  });
+
+  test("data plane — HTTP CONNECT rejects a bad password (407)", async () => {
+    const r = await sh(
+      [
+        "curl",
+        "-s",
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{http_code}",
+        "--max-time",
+        "10",
+        "-p",
+        "-x",
+        `http://${username}:wrong-${password}@${env.serverHost}:8080`,
+        target,
+      ],
+      { failOk: true },
+    );
+    // curl surfaces the proxy's 407 then aborts the tunnel; either a
+    // non-zero exit or an explicit 407 in the response is acceptable.
+    expect(r.code !== 0 || r.stdout.includes("407")).toBe(true);
   });
 
   test("POST /api/users/:id/proxy/rotate — fresh password", async () => {
